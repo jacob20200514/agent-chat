@@ -1,0 +1,60 @@
+{
+  "claude": {
+    "models": [
+      {"id": "default", "label": "Default (Fable 5.2)", "menu": "Default"},
+      {"id": "opus", "label": "Opus 5.5", "menu": "Opus"},
+      {"id": "sonnet", "label": "Sonnet 5.5", "menu": "Sonnet"},
+      {"id": "fable", "label": "Fable 5.2", "menu": "Fable"},
+      {"id": "haiku", "label": "Haiku 5.5", "menu": "Haiku"}
+    ],
+    "efforts": [
+      {"id": "low", "label": "low"}, {"id": "medium", "label": "medium"}, {"id": "high", "label": "high"},
+      {"id": "xhigh", "label": "xhigh"}, {"id": "max", "label": "max"}
+    ],
+    "effort_note": "仅本会话生效"
+  },
+  "codex": {
+    "models": [
+      {"id": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "menu": "GPT-6.1-Sol"},
+      {"id": "gpt-6-astra", "label": "GPT-6-Astra", "menu": "GPT-6-Astra"},
+      {"id": "gpt-6.1-terra", "label": "GPT-6.1 Terra", "menu": "GPT-6.1 Terra"},
+      {"id": "gpt-6-sol", "label": "GPT-6-Sol", "menu": "GPT-6-Sol"},
+      {"id": "gpt-6-luna", "label": "GPT-6-Luna", "menu": "GPT-6-Luna"},
+      {"id": "gpt-5.6-sol", "label": "GPT-5.6-Sol", "menu": "GPT-5.6-Sol"},
+      {"id": "gpt-5.6-terra", "label": "GPT-5.6-Terra", "menu": "GPT-5.6-Terra"},
+      {"id": "gpt-5.6-luna", "label": "GPT-5.6-Luna", "menu": "GPT-5.6-Luna"}
+    ],
+    "efforts": [
+      {"id": "low", "label": "low", "menu": "Low"}, {"id": "medium", "label": "medium", "menu": "Medium"},
+      {"id": "high", "label": "high", "menu": "High"}, {"id": "xhigh", "label": "xhigh", "menu": "Extra high"},
+      {"id": "max", "label": "max", "menu": ["More reasoning", "Max"]}, {"id": "ultra", "label": "ultra", "menu": ["More reasoning", "Ultra"]}
+    ],
+    "effort_note": "仅本会话生效；max/ultra 消耗额度更快，Luna 等模型没有 ultra"
+  },
+  "codebuddy": {
+    "models": [
+      {"id": "hy3", "label": "hy3", "menu": "hy3 "},
+      {"id": "hy3-x", "label": "hy3-x", "menu": "hy3-x"},
+      {"id": "deepseek-v4.1-flash", "label": "deepseek-v4.1-flash", "menu": "deepseek-v4.1-flash"},
+      {"id": "glm-5.3", "label": "glm-5.3", "menu": "glm-5.3 "},
+      {"id": "glm-5.3-flash", "label": "glm-5.3-flash", "menu": "glm-5.3-flash"},
+      {"id": "glm-5.2", "label": "glm-5.2", "menu": "glm-5.2"},
+      {"id": "space-bunny", "label": "space-bunny", "menu": "space-bunny"},
+      {"id": "minimax-m3.1-flash", "label": "minimax-m3.1-flash", "menu": "minimax-m3.1-flash"},
+      {"id": "minimax-m2.7", "label": "minimax-m2.7", "menu": "minimax-m2.7"},
+      {"id": "kimi-k3.1-pro", "label": "kimi-k3.1-pro", "menu": "kimi-k3.1-pro"},
+      {"id": "kimi-k3-1", "label": "kimi-k3-1", "menu": "kimi-k3-1"},
+      {"id": "kimi-k2.8-preview", "label": "kimi-k2.8-preview", "menu": "kimi-k2.8-preview"},
+      {"id": "deepseek-v4-pro", "label": "deepseek-v4-pro", "menu": "deepseek-v4-pro"},
+      {"id": "step-5-preview", "label": "step-5-preview", "menu": "step-5-preview"},
+      {"id": "mimo-v2.6-pro", "label": "mimo-v2.6-pro", "menu": "mimo-v2.6-pro"},
+      {"id": "hy4free", "label": "hy4free", "menu": "hy4free"},
+      {"id": "hy4std", "label": "hy4std", "menu": "hy4std"}
+    ],
+    "efforts": [
+      {"id": "low", "label": "low"}, {"id": "medium", "label": "medium"}, {"id": "high", "label": "high"},
+      {"id": "xhigh", "label": "xhigh"}, {"id": "max", "label": "max"}
+    ],
+    "effort_note": "CodeBuddy 没有仅本会话的档位：这里的选择会成为它的全局默认（含每日日报）"
+  }
+}

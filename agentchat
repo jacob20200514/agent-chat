@@ -1,0 +1,87 @@
+#!/bin/bash
+# agentchat install|start|stop|restart|status|passwd|logs
+set -euo pipefail
+LABEL=com.openclaw.agent-chat
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+DATA="$HOME/.agent-chat"
+PORT=18795
+
+# The repo this script lives in; ~/.local/bin/agentchat is a symlink to it.
+SELF="$0"
+if [ -L "$SELF" ]; then SELF="$(readlink "$SELF")"; fi
+REPO="$(cd "$(dirname "$SELF")" && pwd)"
+
+# The interpreter the service runs with, as recorded at install time.
+service_python() { /usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null; }
+
+# hashlib.scrypt needs a Python built on OpenSSL; the one Apple ships (/usr/bin/python3) is not.
+find_python() {
+  local candidate
+  for candidate in "${AGENT_CHAT_PYTHON:-}" "$(service_python || true)" "$(command -v python3 || true)" /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -c 'import hashlib, sys; sys.exit(not hasattr(hashlib, "scrypt"))' 2>/dev/null; then
+      echo "$candidate"; return 0
+    fi
+  done
+  return 1
+}
+
+install() {
+  local python tmux_bin
+  python="$(find_python)" || { echo "没有找到可用的 Python 3（系统自带的 /usr/bin/python3 不行）。先运行: brew install python"; exit 1; }
+  tmux_bin="$(PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" command -v tmux)" || { echo "没有找到 tmux。先运行: brew install tmux"; exit 1; }
+  mkdir -p "$DATA" "$HOME/Library/LaunchAgents" "$HOME/.local/bin"
+  chmod 700 "$DATA"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$python</string>
+    <string>$REPO/server.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(dirname "$tmux_bin"):/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LANG</key><string>en_US.UTF-8</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$DATA/server.log</string>
+  <key>StandardErrorPath</key><string>$DATA/server.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null
+  ln -sf "$REPO/agentchat" "$HOME/.local/bin/agentchat"
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  # bootout returns before the old process is gone; bootstrap fails until it is.
+  local try
+  for try in 1 2 3 4 5 6 7 8 9 10; do
+    if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then break; fi
+    if [ "$try" = 10 ]; then echo "服务没有启动成功，运行 agentchat logs 看日志"; exit 1; fi
+    sleep 1
+  done
+  echo "已安装并启动（开机自启）：http://127.0.0.1:$PORT"
+  echo "下一步："
+  echo "  1. 用 Tailscale 提供 HTTPS（登录状态只在 HTTPS 下保存）："
+  echo "     tailscale serve --bg --https=11443 http://127.0.0.1:$PORT"
+  echo "  2. 在手机或电脑上打开 tailscale serve status 显示的地址，第一次打开时设置登录密码。"
+  echo "     请装好后马上去设：设好之前，能打开这个地址的人都可以抢先设置。"
+}
+
+case "${1:-status}" in
+  install) install ;;
+  start)   launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null || launchctl kickstart "$DOMAIN/$LABEL" ;;
+  stop)    launchctl bootout "$DOMAIN/$LABEL" ;;
+  restart) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
+  status)  launchctl list | /usr/bin/grep "$LABEL" || echo "未运行"; curl -s --noproxy '*' -o /dev/null -w "本机 http %{http_code}\n" "http://127.0.0.1:$PORT/" || true ;;
+  passwd)  "$(service_python)" "$REPO/server.py" set-password ;;
+  logs)    tail -n 50 "$DATA/server.log" ;;
+  *) echo "用法: agentchat install|start|stop|restart|status|passwd|logs"; exit 2 ;;
+esac
