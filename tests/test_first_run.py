@@ -72,5 +72,27 @@ class FirstRun(unittest.TestCase):
         self.assertFalse(self.call('/api/me')[1]['password_set'])
 
 
+class DirectAccess(unittest.TestCase):
+    def setUp(self):
+        self.server_module = importlib.import_module('server')
+        self.was = self.server_module.TAILNET
+        self.server_module.TAILNET = True
+
+    def tearDown(self):
+        self.server_module.TAILNET = self.was
+
+    def test_only_tailnet_traffic_addressed_by_ip(self):
+        allowed = self.server_module.direct_allowed
+        me, phone = '100.101.102.103', '100.64.0.9'
+        self.assertTrue(allowed(phone, me, me + ':18795'))
+        self.assertFalse(allowed('192.168.1.20', '192.168.1.5', '192.168.1.5:18795'))  # the LAN
+        self.assertFalse(allowed('192.168.1.20', me, me + ':18795'))                    # LAN host aiming at the Tailscale IP
+        self.assertFalse(allowed('8.8.8.8', '203.0.113.7', '203.0.113.7:18795'))        # the internet
+        self.assertFalse(allowed(phone, me, 'evil.example:18795'))                      # DNS rebinding
+        self.assertFalse(allowed(phone, me, None))
+        self.server_module.TAILNET = False
+        self.assertFalse(allowed(phone, me, me + ':18795'))
+
+
 if __name__ == '__main__':
     unittest.main()

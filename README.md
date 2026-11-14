@@ -6,7 +6,7 @@
 
 > **先看清楚再装**：登录网页的人可以在这台 Mac 上执行任意命令（Shell 会话就是远程终端），
 > Agent 默认以免确认模式启动（Claude `bypassPermissions`、Codex `danger-full-access`、CodeBuddy `-y`）。
-> 服务只监听本机 `127.0.0.1`，请只通过 Tailscale 这类私有网络访问，不要暴露到公网。
+> 服务只接受本机和 Tailscale 网络里的访问（局域网和公网的请求一律拒绝），不要用别的方式把它暴露到公网。
 
 ## 安装
 
@@ -16,12 +16,14 @@
 brew install tmux python
 git clone https://github.com/jacob20200514/Agent-chat.git ~/agent-chat
 ~/agent-chat/agentchat install
-tailscale serve --bg --https=11443 http://127.0.0.1:18795
 ```
 
+装完会直接打印访问地址，形如 `http://100.x.x.x:18795`（这台 Mac 的 Tailscale 地址）。在登录了同一个 Tailscale 账号的手机或电脑上打开它即可，不需要在 Tailscale 后台做任何配置。iPhone 上用 Safari 打开后可以"添加到主屏幕"。以后想再看地址：`agentchat url`。
+
 - `agentchat install` 会生成并加载 LaunchAgent `com.openclaw.agent-chat`（开机自启、崩溃自动拉起），并把 `agentchat` 命令链接到 `~/.local/bin`。移动了仓库目录或换了 Python 后重新运行一次。
-- 找不到 `tailscale` 命令时用 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`。第一次用 Serve 需要按提示在 Tailscale 后台开启 HTTPS。
-- 运行 `tailscale serve status` 看到的 `https://<机器名>.<tailnet>.ts.net:11443` 就是访问地址，只有你自己 Tailscale 网络里的设备能打开。iPhone 上用 Safari 打开后可以"添加到主屏幕"。
+- 地址是 `http://` 不是 `https://`：Tailscale 设备之间的流量本身是加密的，所以不需要证书。服务只回应"从 Tailscale 地址发来、发往本机 Tailscale 地址、并且用这个 IP 打开"的请求。
+- 手机打不开时：确认手机的 Tailscale 已连接；Mac 开了系统防火墙的话，在「系统设置 → 网络 → 防火墙 → 选项」里允许 Python 接收传入连接。
+- 想用 Tailscale 的 HTTPS 域名（需要在 Tailscale 后台开启 HTTPS 证书）：改用 `agentchat install --https-only`，服务就只监听 `127.0.0.1`，再运行 `tailscale serve --bg --https=11443 http://127.0.0.1:18795`，地址见 `tailscale serve status`。
 
 ## 设置密码
 

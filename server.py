@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Agent Chat: a phone-sized web front for the agent CLIs living in this Mac's tmux sessions.
 
-Standard library only. Listens on 127.0.0.1; Tailscale Serve puts tailnet-only HTTPS in front.
+Standard library only. Listens on 127.0.0.1 with Tailscale Serve's tailnet-only HTTPS in front, or, with
+AGENT_CHAT_TAILNET=1, also answers plain HTTP on this Mac's Tailscale address (WireGuard carries it).
 The web and a terminal (Termius) drive the same tmux session: output is read with capture-pane,
 input goes in with paste-buffer / send-keys. The only programs this server starts are tmux and the
 three fixed agent commands below; text sent to a session that sits at a shell prompt is run by that
@@ -9,6 +10,7 @@ shell, so the page is a remote terminal for whoever holds the password.
 """
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -26,6 +28,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('AGENT_CHAT_HOME', Path.home() / '.agent-chat'))
 HOST = '127.0.0.1'
+# Direct access by Tailscale IP, for a tailnet without HTTPS certificates. The socket then has to listen on
+# every interface (the Tailscale address may not exist yet at boot), so each request is filtered instead:
+# see direct_allowed.
+TAILNET = os.environ.get('AGENT_CHAT_TAILNET') == '1'
+TAILSCALE_RANGE = ipaddress.ip_network('100.64.0.0/10')
 PORT = int(os.environ.get('AGENT_CHAT_PORT', '18795'))
 TMUX = os.environ.get('AGENT_CHAT_TMUX') or shutil.which('tmux') or '/opt/homebrew/bin/tmux'
 COOKIE = 'agent_chat'
@@ -130,6 +137,19 @@ def drop_login(token):
         auth = load('auth.json', {})
         auth.get('logins', {}).pop(hashlib.sha256((token or '').encode()).hexdigest(), None)
         save('auth.json', auth)
+
+
+def direct_allowed(peer, local, host):
+    """A request that did not come through loopback is served only if it is tailnet traffic: sent from a
+    Tailscale address, to this Mac's Tailscale address, and asked for by that IP. The first two keep the
+    LAN and the internet out although the socket listens everywhere. The Host rule stops DNS rebinding,
+    where a web page's own domain is pointed at this address so its scripts count as same-origin -- on a
+    fresh install that would let the page set the first password."""
+    try:
+        tailnet = ipaddress.ip_address(peer) in TAILSCALE_RANGE and ipaddress.ip_address(local) in TAILSCALE_RANGE
+    except ValueError:
+        return False
+    return TAILNET and tailnet and (host or '').rsplit(':', 1)[0] == local
 
 
 # ---- tmux -----------------------------------------------------------------------------------------
@@ -519,12 +539,27 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError('too large')
         return json.loads(self.rfile.read(length) or b'{}')
 
+    def direct(self):
+        return self.client_address[0] != HOST
+
+    def refused(self):
+        if self.direct() and not direct_allowed(self.client_address[0], self.connection.getsockname()[0], self.headers.get('Host')):
+            self.reply(403, {'error': '只能通过本机或 Tailscale 地址（http://100.x.x.x:%d）访问' % PORT})
+            return True
+        return False
+
+    def cookie_flags(self):
+        # Secure cookies are not kept over plain HTTP; a direct tailnet request is plain HTTP by design.
+        return '; Path=/; HttpOnly; SameSite=Strict' + ('' if self.direct() else '; Secure')
+
     def same_origin(self):
         origin = self.headers.get('Origin')
         host = self.headers.get('Host', '')
         return self.headers.get('X-Agent-Chat') == '1' and (not origin or origin.split('://', 1)[-1] == host)
 
     def do_GET(self):
+        if self.refused():
+            return
         path = self.path.split('?')[0]
         static = {'/': ('index.html', 'text/html'), '/app.js': ('app.js', 'application/javascript'), '/manifest.json': ('manifest.json', 'application/json'),
                   '/icon.svg': ('icon.svg', 'image/svg+xml'), '/apple-touch-icon.png': ('apple-touch-icon.png', 'image/png')}
@@ -570,6 +605,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         try:
+            if self.refused():
+                return
             if not self.same_origin():
                 return self.reply(403, {'error': 'forbidden'})
             body = self.body()
@@ -586,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(401, {'error': '请先登录'})
             if path == '/api/logout':
                 drop_login(self.token())
-                return self.reply(200, {}, headers=[('Set-Cookie', COOKIE + '=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict')])
+                return self.reply(200, {}, headers=[('Set-Cookie', COOKIE + '=; Max-Age=0' + self.cookie_flags())])
             if path == '/api/sessions':
                 return self.reply(200, {'name': create_session(body.get('agent'), body.get('nickname'))})
             match = re.fullmatch(r'/api/sessions/([^/]+)/(send|key|model|effort|new|kill|rename)', path)
@@ -663,7 +700,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.logged_in(bool(body.get('remember')))
 
     def logged_in(self, remember_me):
-        cookie = COOKIE + '=' + new_login(remember_me) + '; Path=/; HttpOnly; Secure; SameSite=Strict' + ('; Max-Age=%d' % REMEMBER_SECONDS if remember_me else '')
+        cookie = COOKIE + '=' + new_login(remember_me) + self.cookie_flags() + ('; Max-Age=%d' % REMEMBER_SECONDS if remember_me else '')
         return self.reply(200, {}, headers=[('Set-Cookie', cookie)])
 
 
@@ -684,9 +721,9 @@ def main():
             save('auth.json', {'password': hash_password(first), 'logins': {}})
         print('密码已设置，所有已登录设备需重新登录')
         return
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server = ThreadingHTTPServer(('0.0.0.0' if TAILNET else HOST, PORT), Handler)
     server.daemon_threads = True
-    print('agent-chat listening on http://%s:%d' % (HOST, PORT), flush=True)
+    print('agent-chat listening on http://%s:%d%s' % (HOST, PORT, ' and this Mac\'s Tailscale address' if TAILNET else ''), flush=True)
     server.serve_forever()
 
 

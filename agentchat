@@ -1,5 +1,5 @@
 #!/bin/bash
-# agentchat install|start|stop|restart|status|passwd|logs
+# agentchat install [--https-only]|url|start|stop|restart|status|passwd|logs
 set -euo pipefail
 LABEL=com.openclaw.agent-chat
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -26,8 +26,22 @@ find_python() {
   return 1
 }
 
+# This Mac's Tailscale address (100.64.0.0/10), read from the interfaces so no Tailscale CLI is needed.
+tailscale_ip() { ifconfig | /usr/bin/sed -nE 's/^[[:space:]]*inet (100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+) .*/\1/p' | head -n 1; }
+
+url() {
+  local ip
+  if [ "$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:AGENT_CHAT_TAILNET' "$PLIST" 2>/dev/null)" != 1 ]; then
+    echo "这台机器装的是仅 HTTPS 方式：地址见 tailscale serve status"; return 0
+  fi
+  ip="$(tailscale_ip)"
+  if [ -z "$ip" ]; then echo "没有找到 Tailscale 地址：请先打开 Tailscale 并登录，然后再运行 agentchat url"; return 1; fi
+  echo "http://$ip:$PORT"
+}
+
 install() {
-  local python tmux_bin
+  local python tmux_bin tailnet=1
+  if [ "${1:-}" = "--https-only" ]; then tailnet=0; elif [ -n "${1:-}" ]; then echo "用法: agentchat install [--https-only]"; exit 2; fi
   python="$(find_python)" || { echo "没有找到可用的 Python 3（系统自带的 /usr/bin/python3 不行）。先运行: brew install python"; exit 1; }
   tmux_bin="$(PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" command -v tmux)" || { echo "没有找到 tmux。先运行: brew install tmux"; exit 1; }
   mkdir -p "$DATA" "$HOME/Library/LaunchAgents" "$HOME/.local/bin"
@@ -48,6 +62,7 @@ install() {
   <dict>
     <key>PATH</key><string>$(dirname "$tmux_bin"):/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>LANG</key><string>en_US.UTF-8</string>
+    <key>AGENT_CHAT_TAILNET</key><string>$tailnet</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -67,21 +82,25 @@ EOF
     if [ "$try" = 10 ]; then echo "服务没有启动成功，运行 agentchat logs 看日志"; exit 1; fi
     sleep 1
   done
-  echo "已安装并启动（开机自启）：http://127.0.0.1:$PORT"
-  echo "下一步："
-  echo "  1. 用 Tailscale 提供 HTTPS（登录状态只在 HTTPS 下保存）："
-  echo "     tailscale serve --bg --https=11443 http://127.0.0.1:$PORT"
-  echo "  2. 在手机或电脑上打开 tailscale serve status 显示的地址，第一次打开时设置登录密码。"
-  echo "     请装好后马上去设：设好之前，能打开这个地址的人都可以抢先设置。"
+  echo "已安装并启动（开机自启）。"
+  if [ "$tailnet" = 1 ]; then
+    echo "在登录了同一个 Tailscale 账号的手机或电脑上打开下面的地址，第一次打开时设置登录密码："
+    url || true
+  else
+    echo "仅 HTTPS 方式，下一步： tailscale serve --bg --https=11443 http://127.0.0.1:$PORT"
+    echo "然后打开 tailscale serve status 显示的地址，第一次打开时设置登录密码。"
+  fi
+  echo "请装好后马上去设：设好之前，能打开这个地址的人都可以抢先设置。"
 }
 
 case "${1:-status}" in
-  install) install ;;
+  install) install "${2:-}" ;;
+  url)     url ;;
   start)   launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null || launchctl kickstart "$DOMAIN/$LABEL" ;;
   stop)    launchctl bootout "$DOMAIN/$LABEL" ;;
   restart) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
   status)  launchctl list | /usr/bin/grep "$LABEL" || echo "未运行"; curl -s --noproxy '*' -o /dev/null -w "本机 http %{http_code}\n" "http://127.0.0.1:$PORT/" || true ;;
   passwd)  "$(service_python)" "$REPO/server.py" set-password ;;
   logs)    tail -n 50 "$DATA/server.log" ;;
-  *) echo "用法: agentchat install|start|stop|restart|status|passwd|logs"; exit 2 ;;
+  *) echo "用法: agentchat install [--https-only]|url|start|stop|restart|status|passwd|logs"; exit 2 ;;
 esac
