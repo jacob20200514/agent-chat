@@ -81,13 +81,13 @@ $('list').addEventListener('touchend', (event) => {
 function renderHeader() {
   const s = state.current; if (!s) return;
   $('chat-name').textContent = s.nickname;
-  $('chat-sub').textContent = [s.agent_label, stateLabel(s.state), s.model, s.effort].filter(Boolean).join(' · ');
+  $('chat-sub').textContent = [s.agent_label, s.choice ? '等你选择' : stateLabel(s.state), s.model, s.effort].filter(Boolean).join(' · ');
   $('chat-dot').className = 'dot ' + s.state;
   const usable = !!s.agent && s.state !== 'exited';
   for (const id of ['model', 'effort', 'new']) $(id).disabled = !usable;
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
   $('send').disabled = s.dead;
-  $('input').placeholder = usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
+  $('input').placeholder = s.choice ? '在这里回复选项（如数字）后发送…' : usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
 }
 // The pane is one stream of text. Lines the CLI marks as the user's prompt become right-hand bubbles and
 // split it into blocks, so each stretch of agent output can be copied on its own.

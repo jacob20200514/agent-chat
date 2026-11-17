@@ -306,6 +306,15 @@ def busy(text):
     return 'esc to interrupt' in tail or bool(re.search(r'\(\d+s\b[^)]*esc', tail))
 
 
+def choice_menu(text):
+    """True while the CLI shows a pick-one list (e.g. a question with numbered options): either its key hint
+    is on screen or the cursor sits on a numbered option. Only the bottom of the pane is read."""
+    tail = text.splitlines()[-20:]
+    hint = any(re.search(r'enter to select|esc to cancel', line, re.I) for line in tail)
+    cursor = any(re.search(r'[❯›]\s*\d+\.\s', line) for line in tail)
+    return hint or cursor
+
+
 def send_keys(name, *keys, pause=0.12):
     for key in keys:
         tmux('send-keys', '-t', target(name), key)
@@ -362,6 +371,8 @@ def slash(name, command):
     """Type a slash command into an empty input box. If a draft is already sitting there (typed in the
     terminal, or a message the CLI has not taken yet), the command would be glued onto it and sent as a
     prompt -- seen with Codex on 2026-11-14 -- so what was typed is taken back and the action refused."""
+    if choice_menu(screen(name)):
+        raise RuntimeError('CLI 正停在选择菜单里，请先在输入框回复或在终端里选完，再切换')
     tmux('send-keys', '-t', target(name), '-l', command)
     time.sleep(0.4)
     typed = [line.strip() for line in screen(name).splitlines() if command in line]
@@ -580,6 +591,7 @@ class Handler(BaseHTTPRequestHandler):
                         # One capture serves both: the tail tells busy from idle, the history holds the last request.
                         text = clean(capture(row['name']))
                         row['state'] = 'busy' if busy(text) else 'idle'
+                        row['choice'] = choice_menu(text)
                         row['preview'] = last_request(drop_composer(text)) if row['agent'] else ''
                 return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()}, 'options': models()})
             match = re.fullmatch(r'/api/sessions/([^/]+)/output', path)
@@ -587,6 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = find_session(match.group(1))
                 text = capture(session['name'])
                 session['state'] = 'exited' if session['state'] == 'exited' else ('busy' if busy(text) else 'idle')
+                session['choice'] = session['state'] != 'exited' and choice_menu(text)
                 cleaned = clean(text)
                 if session.get('agent') and session['state'] != 'exited':
                     cleaned = drop_composer(cleaned)
