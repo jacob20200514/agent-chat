@@ -1,0 +1,7 @@
+{
+  "name": "agentschat-model-catalog",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.322"
+  }
+}

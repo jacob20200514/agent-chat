@@ -1,7 +1,6 @@
 {
   "claude": {
     "models": [
-      {"id": "default", "label": "Default (Fable 5.2)", "menu": "Default"},
       {"id": "opus", "label": "Opus 5.5", "menu": "Opus"},
       {"id": "sonnet", "label": "Sonnet 5.5", "menu": "Sonnet"},
       {"id": "fable", "label": "Fable 5.2", "menu": "Fable"},

@@ -4,9 +4,9 @@
 Standard library only. Listens on 127.0.0.1 with Tailscale Serve's tailnet-only HTTPS in front, or, with
 AGENT_CHAT_TAILNET=1, also answers plain HTTP on this Mac's Tailscale address (WireGuard carries it).
 The web and a terminal (Termius) drive the same tmux session: output is read with capture-pane,
-input goes in with paste-buffer / send-keys. The only programs this server starts are tmux and the
-three fixed agent commands below; text sent to a session that sits at a shell prompt is run by that
-shell, so the page is a remote terminal for whoever holds the password.
+input goes in with paste-buffer / send-keys. Text sent to a session at a shell prompt is run by that
+shell, so the page is a remote terminal for whoever holds the password. Model pickers query the
+configured agent CLI's model catalog.
 """
 import hashlib
 import hmac
@@ -15,15 +15,21 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import string
 import subprocess
 import sys
 import threading
 import time
+from functools import lru_cache
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import model_catalogs
+import reply_status
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('AGENT_CHAT_HOME', Path.home() / '.agent-chat'))
@@ -44,8 +50,7 @@ HISTORY_LINES = 3000
 # Default commands; zsh -ic gives them the login PATH and proxy env. A machine whose CLI needs another
 # launch line (a node version manager, other flags) overrides 'command' per agent in DATA/agents.json.
 SHELL_ONLY = 'shell'  # "new session" choice that starts no agent
-# Claude and Codex run inline, not on the alternate screen: there tmux keeps no scrollback, so the page
-# could only ever show the last screenful.
+# Agent TUIs run inline so tmux keeps scrollback for the page.
 # Codex's update check is off for these sessions: its "Update available" prompt opens with "Update now"
 # selected, so the first chat message's Enter ran a self-update and Codex exited, closing the tmux
 # session (2026-11-14, when 0.169.0 came out). Updating stays a deliberate step in a terminal.
@@ -53,6 +58,7 @@ AGENTS = {
     'claude': {'label': 'Claude', 'command': 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode bypassPermissions', 'new': '/clear'},
     'codex': {'label': 'Codex', 'command': 'codex -c check_for_update_on_startup=false --no-alt-screen --sandbox danger-full-access --ask-for-approval never', 'new': '/new'},
     'codebuddy': {'label': 'CodeBuddy', 'command': 'codebuddy -y', 'new': '/clear'},
+    'pi': {'label': 'Pi', 'command': 'pi --tui-mode regular', 'new': '/new'},
 }
 for _agent, _override in json.loads((DATA / 'agents.json').read_text()).items() if (DATA / 'agents.json').exists() else ():
     AGENTS[_agent]['command'] = _override['command']
@@ -170,14 +176,19 @@ def session_lock(name):
         return session_locks.setdefault(name, threading.Lock())
 
 
-def list_sessions():
-    out = tmux('list-panes', '-a', '-F', '#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_current_command}\t#{pane_tty}\t#{window_active}\t#{pane_active}\t#{pane_dead}', check=False)
+def list_sessions(only=None):
+    """All tmux sessions, or with only= just that one: the chat page polls every second and needs no ps
+    run for the other panes."""
+    out = tmux('list-panes', '-a', '-F', '#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_current_command}\t#{pane_tty}\t#{window_active}\t#{pane_active}\t#{pane_dead}\t#{history_size}\t#{history_limit}', check=False)
     rows = {}
     for line in out.splitlines():
-        name, created, attached, command, tty, window_active, pane_active, dead = line.split('\t')
+        name, created, attached, command, tty, window_active, pane_active, dead, history_size, history_limit = line.split('\t')
+        if only is not None and name != only:
+            continue
         if name in rows and not (window_active == '1' and pane_active == '1'):
             continue
-        rows[name] = {'name': name, 'created': int(created), 'attached': int(attached), 'command': command, 'tty': tty, 'dead': dead == '1'}
+        rows[name] = {'name': name, 'created': int(created), 'attached': int(attached), 'command': command, 'tty': tty, 'dead': dead == '1',
+                      'history_complete': int(history_size) <= HISTORY_LINES and int(history_size) < int(history_limit)}
     meta = load('sessions.json', {})
     result = []
     for row in rows.values():
@@ -187,32 +198,44 @@ def list_sessions():
         result.append({'name': row['name'], 'nickname': saved.get('nickname') or row['name'], 'agent': None if shell else agent,
                        'agent_label': AGENTS[agent]['label'] if agent and not shell else ('Shell' if shell else '未知'),
                        'created': row['created'], 'attached': row['attached'], 'model': saved.get('model'), 'effort': saved.get('effort'),
-                       'state': 'exited' if shell else 'unknown', 'dead': row['dead']})
+                       'state': 'exited' if shell else 'unknown', 'dead': row['dead'], 'history_complete': row['history_complete'],
+                       '_agent_process': row.get('_agent_process')})
     return sorted(result, key=lambda r: -r['created'])
 
 
 def detect_agent(row):
     """What runs in the pane's foreground, from the processes on its tty."""
     try:
-        ps = subprocess.run(['ps', '-o', 'command=', '-t', row['tty'].replace('/dev/', '')], capture_output=True, text=True, timeout=5).stdout
-    except Exception:
+        ps = subprocess.run(['ps', '-o', 'pid=,etime=,command=', '-t', row['tty'].replace('/dev/', '')],
+                            capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
         return None
     for line in ps.splitlines():
-        words = line.split()
-        head = ' '.join(words[:6])
-        if 'codebuddy' in head:
-            return 'codebuddy'
-        if re.search(r'(^|[/ ])codex( |$)', head):
-            return 'codex'
-        if re.search(r'(^|[/ ])claude(\.exe)?( |$)', head):
-            return 'claude'
+        fields = line.split(None, 2)
+        if len(fields) != 3 or not fields[0].isdigit():
+            continue
+        pid, elapsed, command = fields
+        words = command.split()
+        executable = Path(words[0]).name
+        if executable == 'node' and len(words) > 1:
+            executable = Path(words[1]).name
+        agent = 'claude' if executable == 'claude.exe' else executable
+        if agent not in AGENTS:
+            continue
+        days, sep, clock = elapsed.partition('-')
+        seconds = int(days) * 86400 if sep else 0
+        for i, part in enumerate(reversed((clock if sep else days).split(':'))):
+            seconds += int(part) * 60 ** i
+        # ps elapsed time has one-second precision.
+        row['_agent_process'] = int(pid), int(time.time()) - seconds - 2
+        return agent
     return None
 
 
 def find_session(name):
     if not NAME_RE.match(name or ''):
         raise KeyError(name)
-    for row in list_sessions():
+    for row in list_sessions(name):
         if row['name'] == name:
             return row
     raise KeyError(name)
@@ -255,9 +278,12 @@ PROMPT_LINE = re.compile(r'^\s*[❯›>](\s|$)')
 MENU_ROW = re.compile(r'^\s*[❯›>]\s+\d+\.\s')
 
 
-def drop_composer(text):
+def drop_composer(text, agent=None):
     """The agent CLIs keep their input box and hint footer at the bottom of the pane; it is not chat.
     The last prompt-marked line is that input box, so it and the few footer lines under it are cut."""
+    if agent == 'pi':
+        # Pi's editor has no prompt marker. A bare > belongs to its native menu's search field.
+        return text
     lines = text.split('\n')
     for i in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
         if PROMPT_LINE.match(lines[i]):
@@ -301,18 +327,254 @@ def last_request(text, limit=120):
     return ''
 
 
-def busy(text):
-    tail = '\n'.join(text.splitlines()[-12:]).lower()
-    return 'esc to interrupt' in tail or bool(re.search(r'\(\d+s\b[^)]*esc', tail))
+SPINNER = '·✢✳✶✻✽✷✸✹✺*'
+ELAPSED = r'\((?:\d+h )?(?:\d+m )?\d+s'
+
+
+def composer_busy(lines, agent):
+    # Read native status immediately above the current composer, not old tool output or a typed draft.
+    borders = [i for i, line in enumerate(lines) if re.fullmatch(r'\s*─{5,}\s*', line)]
+    if len(borders) < 2:
+        return False
+    top, bottom = borders[-2:]
+    if not any(PROMPT_LINE.match(line) and not MENU_ROW.match(line) for line in lines[top + 1:bottom]):
+        return False
+    status = [line for line in lines[:top] if line.strip()]
+    if not status:
+        return False
+    if re.match(r'\s*⎿\s+Running(?:…|\.\.\.)\s+\(\d+[hms]\b', status[-1], re.I):
+        return True
+    # The status row can carry a hanging block below it: a tip, the /btw hint or a todo list.
+    i = len(status) - 1
+    while i > 0 and re.match(r' {3,}\S', status[i]):
+        i -= 1
+    if i > 0 and re.match(r'\s*[⎿└]\s', status[i]):
+        i -= 1
+    row = status[i].rstrip()
+    if agent == 'codebuddy':
+        # The CLI renders its turn timer one space in, optionally after a spinner and the clipped verb,
+        # with optional phase/tokens and an ellipsis when the pane clips the row. The timer is present
+        # across phases, not just while a tool runs.
+        return bool(re.fullmatch(f'(?:[{SPINNER}] [^()]+)? {ELAPSED}(?: · .+)?[)…]', row))
+    # Claude's spinner row is the verb or the active task with an ellipsis, then the timer (possibly clipped
+    # with the interrupt hint); before the timer shows it is a single verb. A finished turn reads
+    # "✻ Worked for 26s", which a narrow pane may also clip with an ellipsis.
+    return bool(re.fullmatch(f'[{SPINNER}] (?:\\S[^()]*… {ELAPSED}.*|\\S+…)', row))
+
+
+def busy(text, agent=None):
+    lines = text.rstrip().splitlines()
+    if agent == 'pi':
+        # Pi's spinner is embedded in the editor border, even without an Esc hint.
+        borders = [line for line in lines[-32:] if re.match(r'^─{2,}(?:\s*[\u2801-\u28ff]|─*\s*$)', line)]
+        if len(borders) >= 2 and re.search(r'[\u2801-\u28ff]', borders[-2]):
+            return True
+    tail = '\n'.join(lines[-12:]).lower()
+    if 'esc to interrupt' in tail or re.search(r'\(\d+s\b[^)]*esc', tail):
+        return True
+    # Codex clips "• Working (1m 05s • esc to interrupt)" to the pane width; a long header hides the hint.
+    if agent == 'codex' and any(re.match(f'• .*{ELAPSED}(?: •.*|…)$', line.rstrip()) for line in lines[-12:]):
+        return True
+    return agent in ('claude', 'codebuddy') and composer_busy(lines[-24:], agent)
+
+
+def pi_message_text(message):
+    content = message.get('content', [])
+    return content if isinstance(content, str) else ' '.join(part['text'] for part in content if part.get('type') == 'text')
+
+
+@lru_cache(maxsize=16)
+def pi_transcript(path, modified_ns, size):
+    """Pi journals contain typed messages: neither terminal redraws nor tool output are replies."""
+    with path.open(encoding='utf-8') as log:
+        header = json.loads(next(log))
+        if header.get('type') != 'session':
+            return '', None, None, None
+        entries = {}
+        leaf = None
+        for line in log:
+            if not line.endswith('\n'):
+                break  # the Pi process may still be appending this entry
+            entry = json.loads(line)
+            if entry.get('id'):
+                leaf = entry['id']
+                entries[leaf] = entry
+    preview, reply, selection = None, None, None
+    while leaf and (preview is None or reply is None or selection is None):
+        entry = entries.get(leaf, {})
+        leaf = entry.get('parentId')
+        if selection is None and entry.get('type') == 'model_change':
+            selection = (entry.get('provider'), entry.get('modelId'))
+        if entry.get('type') != 'message':
+            continue
+        msg = entry['message']
+        if preview is None and msg['role'] == 'user':
+            text = ' '.join(pi_message_text(msg).split())
+            if text and not text.startswith('/'):
+                preview = text[:120]
+        elif reply is None and msg['role'] == 'assistant' and msg.get('stopReason') == 'stop' and pi_message_text(msg).strip():
+            reply = (entry['id'], entry.get('timestamp'))
+    return preview or '', reply, selection, header.get('id')
+
+
+def update_pi_turn(session):
+    # Only use metadata explicitly published by this pane, not another Pi session in the same directory.
+    settings = tmux('display-message', '-p', '-t', target(session['name']),
+                    '#{@agent-chat-pi-provider}\t#{@agent-chat-pi-session}\t#{@agent-chat-pi-request}',
+                    check=False).removesuffix('\n')
+    provider, _, rest = settings.partition('\t')
+    filename, _, request = rest.partition('\t')
+    if provider:
+        session['model_provider'] = provider if re.fullmatch(r'[\w.-]+', provider) and provider != '-' else None
+    session['preview'] = request
+    path = Path(filename)
+    if not path.is_absolute() or path.suffix != '.jsonl':
+        return
+    try:
+        info = path.stat()
+        preview, reply, selection, session_id = pi_transcript(path, info.st_mtime_ns, info.st_size)
+        session['preview'] = preview or request
+        if session_id:
+            session['reply'] = reply_status.reply_status(f'pi:{path}', reply)
+        # Older instances of the extension only publish the transcript path. The footer may omit
+        # the provider, so match the recorded selection against the visible model before using it.
+        if not provider and not session.get('model_provider') and selection and selection[1] == session.get('model'):
+            session['model_provider'] = selection[0]
+    except FileNotFoundError:
+        # Pi has a session path before persisting the first turn.
+        session['reply'] = reply_status.reply_status(f'pi:{path}')
+    except (OSError, ValueError, StopIteration):
+        pass  # concurrent rewrite; retry on the next poll
+
+
+def session_snapshot(session, raw):
+    process = session.pop('_agent_process', None)
+    text = clean(raw)
+    working = None
+    if session['agent'] and session['agent'] != 'pi' and session['state'] != 'exited':
+        # The CLI's own records decide when it exposes them; the screen is the fallback.
+        reply, working = reply_status.native_status(session['agent'], process, Path.home())
+        if reply is not None:
+            session['reply'] = reply
+    if session['state'] != 'exited':
+        if working is None:
+            working = busy(raw, session['agent'])
+        session['state'] = 'busy' if working else 'idle'
+    session['choice'] = session['state'] != 'exited' and choice_menu(text)
+    update_agent_status(session, text)
+    if session['agent'] == 'pi' and session['state'] != 'exited':
+        update_pi_turn(session)
+    return text
 
 
 def choice_menu(text):
     """True while the CLI shows a pick-one list (e.g. a question with numbered options): either its key hint
     is on screen or the cursor sits on a numbered option. Only the bottom of the pane is read."""
-    tail = text.splitlines()[-20:]
-    hint = any(re.search(r'enter to select|esc to cancel', line, re.I) for line in tail)
+    tail = text.rstrip().splitlines()[-20:]
+    hint = any(re.search(r'enter to select|esc to cancel|escape/ctrl\+c cancel', line, re.I) for line in tail)
     cursor = any(re.search(r'[❯›]\s*\d+\.\s', line) for line in tail)
     return hint or cursor
+
+
+def codex_usage_view(text):
+    """识别 Codex 当前屏幕的 /usage 菜单或报表，避免把消息发给覆盖对话的界面。"""
+    title = re.search(r'(?m)^[ \t]*Usage(?:[ \t]+·[^\n]*)?[ \t]*$', text)
+    footer = re.search(
+        r'(?m)^[ \t]*(?:(?:enter open|pgup/pgdn scroll)\s*·\s*)?esc back[ \t]*'
+        r'(?:\n[ \t]*tab report\b[^\n]*)?\s*\Z', text)
+    return bool(title and footer)
+
+
+MODEL_FOOTER = re.compile(r'\s*([A-Za-z0-9][A-Za-z0-9_. -]*?)\s+(minimal|low|medium|high|xhigh|max|ultra)\s+·(?:\s.*)?', re.I)
+CLAUDE_MODEL_LABEL = re.compile(r'\b((?:Opus|Sonnet|Fable|Haiku)\s+\d+(?:\.\d+)*)\b', re.I)
+PI_FOOTER = re.compile(r'(?:^|\s)(?:\?|\d+(?:\.\d+)?%)/\S+(?: \(auto\))?(?: • xp)? {2,}'
+                       r'(?:\(([\w.-]+)\) )?([\w./:-]+)'
+                       r'(?: • (?:thinking )?(off|minimal|low|medium|high|xhigh|max|ultra))?(?: → .*)?$')
+
+
+def welcome_model_status(agent, lines, *, complete_history=True):
+    """Claude and existing CodeBuddy processes print a welcome block, then local command results.
+    Claude can reprint its startup defaults after a redraw or /clear: its latest session-only
+    confirmations take precedence. Only a result following /model or /effort can update them;
+    prose in an agent reply is not a model switch."""
+    label, effort, command = None, None, None
+    confirmed_label, confirmed_effort = None, None
+    for i, line in enumerate(lines):
+        if agent == 'claude' and re.match(r'^[^A-Za-z0-9]*Claude Code v\d', line):
+            label, effort, command = None, None, None
+            # With a partial capture, a preceding session switch may have scrolled out. The welcome
+            # defaults cannot then establish the current value, even if a redraw kept them visible.
+            header = ' '.join(lines[i:i + 4]) if complete_history else ''
+            model = CLAUDE_MODEL_LABEL.search(header)
+            level = re.search(r'\bwith (low|medium|high|xhigh|max) effort\b', header, re.I)
+            if model:
+                label, effort = model.group(1), level.group(1).lower() if level else None
+        elif agent == 'codebuddy' and re.match(r'^╭[─ ]*CodeBuddy Code\b', line):
+            label, effort, command = None, None, None
+            cells = []
+            for row in lines[i + 1:i + 22]:
+                if PROMPT_LINE.match(row):
+                    break
+                cells.append(row.split('│', 1)[0].strip())
+            for model, level in zip(cells, cells[1:]):
+                if re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]*', model) and level in ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+                    label, effort = model, level
+        prompt = USER_LINE.match(line)
+        if prompt:
+            command = prompt.group(2).split()[0]
+        if command == '/model':
+            if agent == 'claude':
+                result = re.match(r'^\s*⎿\s+Set model to (.+)$', line)
+                model = CLAUDE_MODEL_LABEL.search(result.group(1)) if result else None
+                if model:
+                    label, command = model.group(1), None
+                    confirmed_label = label
+            else:
+                result = re.match(r'^\s*└\s+Switched (?:this session|model) to (.+?)\.(?:\s.*)?$', line)
+                if result:
+                    label, command = result.group(1), None
+        elif command == '/effort':
+            pattern = (r'^\s*⎿\s+Set effort level to (low|medium|high|xhigh|max)\b' if agent == 'claude'
+                       else r'^\s*└\s+Model reasoning effort set to (minimal|low|medium|high|xhigh|max)\.')
+            result = re.match(pattern, line)
+            if result:
+                effort, command = result.group(1), None
+                if agent == 'claude':
+                    confirmed_effort = effort
+    return confirmed_label or label, confirmed_effort or effort
+
+
+def update_agent_status(session, text):
+    """Reuse the polling capture to read the CLI's status, without typing or trusting Web-saved values."""
+    agent = session.get('agent')
+    if agent not in AGENTS:
+        return
+    session.update(model=None, effort=None)
+    if session['state'] == 'exited':
+        return
+    lines = text.rstrip().splitlines()
+    if agent == 'pi':
+        session['model_provider'] = None
+        for line in reversed(lines[-3:]):
+            match = PI_FOOTER.search(line)
+            if match and match[2] not in ('no-model', 'unknown'):
+                session.update(model_provider=match[1], model=match[2], effort=match[3])
+                break
+        return
+    label, effort = None, None
+    if agent in ('claude', 'codebuddy'):
+        label, effort = welcome_model_status(agent, lines, complete_history=session.get('history_complete', True))
+    if agent in ('codex', 'codebuddy'):
+        for line in reversed(lines[-2:]):
+            match = MODEL_FOOTER.fullmatch(line)
+            if match:
+                label, effort = match.groups()
+                break
+    if label:
+        key = re.sub(r'\s+', '', label).lower()
+        label = next((o['id'] for o in models()[agent]['models']
+                      if key in (re.sub(r'\s+', '', o['label']).lower(), o['id'].lower())), label.lower())
+    session.update(model=label, effort=effort.lower() if effort else None)
 
 
 def send_keys(name, *keys, pause=0.12):
@@ -330,10 +592,12 @@ def send_text(name, text):
     tmux('send-keys', '-t', target(name), 'Enter')
 
 
-def wait_for(name, pattern, timeout=6.0):
+def wait_for(name, pattern, timeout=6.0, *, after=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
         text = screen(name)
+        if after:
+            text = text.rsplit(after, 1)[-1]
         if re.search(pattern, text):
             return text
         time.sleep(0.2)
@@ -350,11 +614,12 @@ def cursor_line(name):
     return found
 
 
-def walk_to(name, label):
-    """Move a menu's cursor onto the row starting with label. Rows are matched, never counted, so a
-    reordered or longer list cannot select a neighbour."""
-    want = label.lower()
-    hit = lambda: cursor_line(name).lower().startswith(want)
+def walk_to(name, label, *, pattern=None):
+    """Find the menu row by its label so reordering cannot select a neighbour."""
+    match = re.compile(pattern or re.escape(label), re.I).match
+
+    def hit():
+        return match(cursor_line(name).rstrip())
     for _ in range(30):
         if hit():
             return
@@ -364,22 +629,170 @@ def walk_to(name, label):
             return
         send_keys(name, 'Down', pause=0.08)
     send_keys(name, 'Escape')
-    raise RuntimeError('本机 CLI 的菜单里没有「' + label + '」，请更新 models.json 或用方向键手动选择')
+    raise RuntimeError('本机 CLI 的菜单里没有「' + label + '」，请重新打开选项或用方向键手动选择')
 
 
-def slash(name, command):
+def pi_editor_text(text):
+    """Read the plain editor above Pi's slash-command suggestions and status footer."""
+    lines = text.splitlines()
+    borders = [i for i, line in enumerate(lines) if re.fullmatch(r'─{8,}', line.strip())]
+    if len(borders) >= 2:
+        start, end = borders[-2:]
+        return '\n'.join(line.rstrip() for line in lines[start + 1:end]).strip('\n')
+    return None
+
+
+def slash(name, command, *, agent=None):
     """Type a slash command into an empty input box. If a draft is already sitting there (typed in the
     terminal, or a message the CLI has not taken yet), the command would be glued onto it and sent as a
     prompt -- seen with Codex on 2026-11-14 -- so what was typed is taken back and the action refused."""
-    if choice_menu(screen(name)):
+    before = screen(name)
+    if agent == 'pi' and busy(before, agent):
+        raise RuntimeError('Pi 正在处理消息，请等这轮结束后再试')
+    if choice_menu(before):
         raise RuntimeError('CLI 正停在选择菜单里，请先在输入框回复或在终端里选完，再切换')
+    if agent == 'pi' and pi_editor_text(before) != '':
+        raise RuntimeError('Pi 输入框里有草稿或当前界面无法操作，请返回空白输入框后再试')
     tmux('send-keys', '-t', target(name), '-l', command)
     time.sleep(0.4)
-    typed = [line.strip() for line in screen(name).splitlines() if command in line]
-    if not any(re.fullmatch(r'[│|]?\s*[❯›>]\s*' + re.escape(command) + r'(\s.*)?', line) for line in typed):
+    after = screen(name)
+    if agent == 'pi':
+        ready = pi_editor_text(after) == command
+    else:
+        ready = any(re.fullmatch(r'[│|]?\s*[❯›>]\s*' + re.escape(command) + r'(\s.*)?', line.strip())
+                    for line in after.splitlines() if command in line)
+    if not ready:
         send_keys(name, *(['BSpace'] * len(command)), pause=0.02)
         raise RuntimeError('输入框里有还没发送的内容，请先发送或清空后再试')
     tmux('send-keys', '-t', target(name), 'Enter')
+
+
+PI_MODEL_ROW = re.compile(r'^([→ ]) (✓ )?\s*([\w./:-]+)(?: \(.*\))? \[([\w.-]+)\](?: · default)?\s*$')
+PI_EFFORT_ROW = re.compile(r'^([→ ]) (✓ )?\s*(off|minimal|low|medium|high|xhigh|max|ultra)\s{2,}(.+)$')
+
+
+def pi_picker(text):
+    """Read the live selector between Pi's editor borders, not mentions in old chat output."""
+    editor = pi_editor_text(text)
+    if not editor or not re.search(r'to select.*to set as default', ' '.join(editor.splitlines()), re.I):
+        return None
+    lines = editor.splitlines()
+    kind = 'effort' if 'Thinking Level' in [line.strip() for line in lines] else 'model'
+    options, cursor = [], None
+    for line in lines:
+        match = (PI_MODEL_ROW if kind == 'model' else PI_EFFORT_ROW).fullmatch(line)
+        if not match:
+            continue
+        marker, current, value, detail = match.groups()
+        id_ = detail + '/' + value if kind == 'model' else value
+        if marker == '→':
+            cursor = len(options)
+        options.append({'id': id_, 'label': value, 'detail': detail.strip(), 'current': bool(current)})
+    if kind == 'model' and not options and not any('models from configured providers' in line or line.startswith('Scope: ') for line in lines):
+        return None
+    pages = next((line.strip()[1:-1] for line in lines if re.fullmatch(r'\s*\(\d+/\d+\)\s*', line)), '')
+    return {'kind': kind, 'options': options, 'cursor': cursor, 'position': pages}
+
+
+def handle_pi_picker(name, kind, body):
+    raw = screen(name)
+    menu = pi_picker(raw)
+    operation = body.get('op', 'open')
+    if operation == 'cancel':
+        if menu and menu['kind'] == kind:
+            send_keys(name, 'Escape')
+        return {}
+    if operation == 'open' and not menu:
+        slash(name, '/model' if kind == 'model' else '/thinking', agent='pi')
+        for _ in range(20):
+            menu = pi_picker(screen(name))
+            if menu:
+                break
+            time.sleep(.1)
+    if not menu or menu['kind'] != kind:
+        raise RuntimeError('Pi 选择菜单未打开或已经变化，请关闭弹窗后重试')
+    if operation == 'open':
+        return menu
+    if operation in ('prev', 'next'):
+        send_keys(name, 'PageUp' if operation == 'prev' else 'PageDown')
+        updated = pi_picker(screen(name))
+        if not updated or updated['kind'] != kind:
+            raise RuntimeError('Pi 菜单已经关闭，请重新打开')
+        return updated
+    if operation != 'select' or not isinstance(body.get('id'), str):
+        raise ValueError('invalid picker operation')
+    requested = body['id']
+    for _ in range(10):
+        if not menu or menu['kind'] != kind or menu['cursor'] is None:
+            break
+        index = next((i for i, item in enumerate(menu['options']) if item['id'] == requested), None)
+        if index is None:
+            break
+        if index == menu['cursor']:
+            send_keys(name, 'Enter')  # Pi's Ctrl+S, deliberately not used, changes the global default.
+            for _ in range(20):
+                raw = screen(name)
+                if not pi_picker(raw) and pi_editor_text(raw) == '':
+                    status = {'agent': 'pi', 'state': 'idle'}
+                    update_agent_status(status, clean(raw))
+                    expected = requested.split('/', 1)[1] if kind == 'model' else requested
+                    if status[kind] == expected:
+                        return {}
+                time.sleep(.1)
+            raise RuntimeError('未能从 Pi 确认切换结果，请查看对话顶部或终端')
+        send_keys(name, 'Up' if index < menu['cursor'] else 'Down')
+        menu = pi_picker(screen(name))
+    raise RuntimeError('Pi 菜单的选项已变化，请关闭弹窗后重试')
+
+
+def codex_options(session):
+    rows = model_catalogs.codex_models(AGENTS['codex']['command'], Path.home())
+    if not rows:
+        raise RuntimeError('Codex 未返回可用模型，请检查 CLI 登录状态后重试')
+    try:
+        choices = [{'id': row['model'], 'label': row['displayName'],
+                    'effort_ids': [item['reasoningEffort'] for item in row['supportedReasoningEfforts']]}
+                   for row in rows]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError('Codex 模型目录格式无法识别') from exc
+    current = dict(session)
+    update_agent_status(current, clean(screen(session['name'])))
+    key = re.sub(r'\s+', '', current['model'] or '').lower()
+    selected = next((option for option in choices
+                     if key in (option['id'].lower(), re.sub(r'\s+', '', option['label']).lower())), None)
+    levels = selected['effort_ids'] if selected else {level for option in choices for level in option['effort_ids']}
+    note = '仅本会话生效；max/ultra 消耗额度更快'
+    if not selected:
+        note += '。当前模型未识别，可选档位以终端菜单为准。'
+    return {'models': choices, 'efforts': [level for level in models()['codex']['efforts'] if level['id'] in levels],
+            'current': {'model': selected['id'] if selected else None, 'effort': current['effort']},
+            'effort_note': note}
+
+
+def model_options(session):
+    agent = session['agent']
+    if agent == 'codex':
+        return codex_options(session)
+    cwd = tmux('display-message', '-p', '-t', target(session['name']), '#{pane_current_path}').rstrip('\n')
+    if not cwd:
+        raise RuntimeError('无法读取当前会话的工作目录')
+    launch = AGENTS[agent]['command']
+    try:
+        if agent == 'claude':
+            choices = [{'id': row['value'], 'label': row['displayName']}
+                       for row in model_catalogs.claude_models(launch, cwd) if row['value'] != 'default']
+        else:
+            choices = [{'id': row['modelId'], 'label': row['modelId']}
+                       for row in model_catalogs.codebuddy_models(launch, cwd)]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError('CLI 模型目录格式无法识别') from exc
+    if not choices:
+        raise RuntimeError('CLI 未返回可用模型，请检查登录状态后重试')
+    current = dict(session)
+    update_agent_status(current, clean(capture(session['name'])))
+    key = (current['model'] or '').lower()
+    selected = next((row['id'] for row in choices if key in (row['id'].lower(), row['label'].lower())), None)
+    return {'models': choices, 'current': {'model': selected}}
 
 
 # Every switch below is made for the session only where the CLI offers that. The plain commands
@@ -388,30 +801,46 @@ def slash(name, command):
 
 def set_model(session, model):
     name, agent = session['name'], session['agent']
-    option = next((m for m in models()[agent]['models'] if m['id'] == model), None)
+    options = model_options(session)
+    option = next((m for m in options['models'] if m['id'] == model), None)
     if not option:
         raise ValueError('unknown model')
+    label = option['label']
+    literal = re.escape(label)
     if agent == 'claude':
         slash(name, '/model')
-        wait_for(name, r'Select model')
-        walk_to(name, option['menu'])
-        send_keys(name, 's')
-        time.sleep(1.0)
-        if 'Switch model?' in screen(name):
+        menu = wait_for(name, r'Select model')
+        label_pattern = literal + r'(?=\s{2,}|\s+✔|$)'
+        if not re.search(r'^\s*(?:❯\s*)?\d+\.\s+' + label_pattern, menu, re.I | re.M) and '▸' in menu:
+            walk_to(name, 'More models', pattern=r'▸\s+More models\b')
             send_keys(name, 'Enter')
+            wait_for(name, r'▾\s+More models')
+        walk_to(name, label, pattern=label_pattern)
+        wait_for(name, r's\s+to\s+use\s+this\s+session\s+only')
+        send_keys(name, 's')
+        changed = r'⎿\s+Set model to\s+' + literal + r'(?=\s|$)'
+        reply = wait_for(name, changed + r'|Switch model\?|Manage usage credits', after='❯ /model')
+        if 'Manage usage credits' in reply:
+            send_keys(name, 'Escape')
+            raise RuntimeError(f'{label} 需要 Claude 用量积分，当前会话未切换')
+        if 'Switch model?' in reply:
+            send_keys(name, 'Enter')
+            wait_for(name, changed, after='❯ /model')
     elif agent == 'codex':
+        label_pattern = literal + r'(?: \(current\))?$'
         slash(name, '/model')
         wait_for(name, r'Select Model')
-        walk_to(name, option['menu'])
+        walk_to(name, label, pattern=label_pattern)
         send_keys(name, 'Enter')
         wait_for(name, r'Select Reasoning Level')
-        effort = next((e for e in models()[agent]['efforts'] if e['id'] == session.get('effort')), None)
+        effort = next((e for e in options['efforts']
+                       if e['id'] == options['current']['effort'] and e['id'] in option['effort_ids']), None)
         if effort:
             try:
                 walk_to_level(name, effort['menu'])
             except RuntimeError:
                 if 'Select Reasoning Level' not in screen(name):
-                    slash(name, '/model'); wait_for(name, r'Select Model'); walk_to(name, option['menu'])
+                    slash(name, '/model'); wait_for(name, r'Select Model'); walk_to(name, label, pattern=label_pattern)
                     send_keys(name, 'Enter'); wait_for(name, r'Select Reasoning Level')
         send_keys(name, 's')
     else:
@@ -420,8 +849,14 @@ def set_model(session, model):
         if "this session only" not in screen(name):
             send_keys(name, 'Tab')
         wait_for(name, r'this session only')
-        walk_to(name, option['menu'])
+        walk_to(name, label, pattern=literal + r'(?=\s|$)')
         send_keys(name, 'Enter')
+        switched = r'Switched this session to'
+        reply = wait_for(name, switched + r'|Select Reasoning Level', after='> /model')
+        if 'Select Reasoning Level' in reply:
+            # CodeBuddy adds this step for some models. Apply its highlighted level in Session scope.
+            send_keys(name, 'Enter')
+            wait_for(name, switched, after='> /model')
     remember(name, model=model)
 
 
@@ -443,7 +878,7 @@ def walk_to_level(name, menu):
 
 def set_effort(session, effort):
     name, agent = session['name'], session['agent']
-    levels = models()[agent]['efforts']
+    levels = (codex_options(session) if agent == 'codex' else models()[agent])['efforts']
     option = next((e for e in levels if e['id'] == effort), None)
     if not option:
         raise ValueError('unknown effort')
@@ -477,19 +912,42 @@ def create_session(agent, nickname):
         raise ValueError('unknown agent')
     nickname = (nickname or '').strip()[:40]
     # The tmux session takes the nickname (tmux itself turns '.' and ':' into '_'), so Termius shows the same name.
-    name = re.sub(r'[\s.:]+', '-', nickname).strip('-') or 'web-' + agent + '-' + secrets.token_hex(3)
-    if name in {r['name'] for r in list_sessions()}:
-        raise RuntimeError('已有同名 tmux 会话「' + name + '」，请换个昵称')
+    supplied_name = re.sub(r'[\s.:]+', '-', nickname).strip('-')
+    if nickname and not supplied_name:
+        supplied_name = 'web-' + agent + '-' + secrets.token_hex(3)
+
+    launch_args = ['-c', str(Path.home())]
+    prefix = 'zsh' if agent == SHELL_ONLY else agent
+    if agent != SHELL_ONLY:
+        # Keep other CLIs phone-wide. Pi truncates its footer from the right after adding token and
+        # usage counters, so a narrow detached pane can hide the model and thinking level entirely.
+        width = '100' if agent == 'pi' else '46'
+        command = AGENTS[agent]['command']
+        if agent == 'pi':
+            command += ' --extension ' + shlex.quote(str(ROOT / 'pi-session-status.ts'))
+        launch_args = ['-x', width, '-y', '50', *launch_args, 'zsh', '-ic', command]
+
+    # tmux checks the name at creation, including races with other requests or terminals.
+    for _ in range(10):
+        name = supplied_name or prefix + '-' + ''.join(secrets.choice(string.ascii_lowercase) for _ in range(3))
+        try:
+            tmux('new-session', '-d', '-s', name, *launch_args)
+        except RuntimeError as error:
+            if str(error) != f'duplicate session: {name}':
+                raise
+            if nickname:
+                raise RuntimeError(f'已有同名 tmux 会话「{name}」，请换个昵称') from error
+        else:
+            break
+    else:
+        raise RuntimeError('暂时无法生成不重复的会话昵称，请重试或填写昵称')
+
     if agent == SHELL_ONLY:
-        # A plain login shell in ~: typed into from the page's message box or from Termius.
-        tmux('new-session', '-d', '-s', name, '-c', str(Path.home()))
-        remember(name, nickname=(nickname or '').strip()[:40] or name)
+        remember(name, nickname=nickname or name)
         return name
-    # Phone-wide until a terminal attaches (tmux then follows that client's size): the CLI wraps its own
-    # lines, and at 80 columns every paragraph would be re-wrapped raggedly on a phone.
-    tmux('new-session', '-d', '-s', name, '-x', '46', '-y', '50', '-c', str(Path.home()), 'zsh', '-ic', AGENTS[agent]['command'])
-    remember(name, agent=agent, nickname=(nickname or '').strip()[:40] or name)
-    threading.Thread(target=accept_trust_prompt, args=(name,), daemon=True).start()
+    remember(name, agent=agent, nickname=nickname or name)
+    if agent != 'pi':
+        threading.Thread(target=accept_trust_prompt, args=(name,), daemon=True).start()
     return name
 
 
@@ -505,13 +963,38 @@ def accept_trust_prompt(name):
                 text = screen(name)
             except RuntimeError:
                 return
-            if 'Yes, I trust this folder' in text:
-                walk_to(name, 'Yes, I trust this folder'); send_keys(name, 'Enter'); return
-            if 'Trust folder only' in text:
-                if cursor_line(name).startswith('Trust folder only'): send_keys(name, 'Enter')
+            if answer_trust_prompt(name, text):
                 return
             if re.search(r'bypass permissions on|Ask Codex to do anything', text):
                 return
+
+
+TRUST_PROMPTS = ('Yes, I trust this folder', 'Trust folder only')
+
+
+def answer_trust_prompt(name, text):
+    """Choose trust when the start-up question is on screen; False when it is not there."""
+    if 'Yes, I trust this folder' in text:
+        walk_to(name, 'Yes, I trust this folder'); send_keys(name, 'Enter'); return True
+    if 'Trust folder only' in text:
+        if cursor_line(name).startswith('Trust folder only'): send_keys(name, 'Enter')
+        return True
+    return False
+
+
+def clear_trust_prompt(name):
+    """The start-up thread stops watching after 20 s. A message sent while the question is still up
+    used to answer it: its Enter picked Claude's default "No, exit" and the session closed
+    (2026-11-21), so the question is answered here before any text goes in."""
+    if not answer_trust_prompt(name, screen(name)):
+        return
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if not any(prompt in screen(name) for prompt in TRUST_PROMPTS):
+            time.sleep(1.0)  # the input box comes up just after the question clears
+            return
+    raise RuntimeError('未发送：信任此目录的提示还没关掉，请用方向键选信任后重发')
 
 
 # ---- http -----------------------------------------------------------------------------------------
@@ -587,22 +1070,33 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/sessions':
                 rows = list_sessions()
                 for row in rows:
-                    if row['state'] != 'exited':
-                        # One capture serves both: the tail tells busy from idle, the history holds the last request.
-                        text = clean(capture(row['name']))
-                        row['state'] = 'busy' if busy(text) else 'idle'
-                        row['choice'] = choice_menu(text)
-                        row['preview'] = last_request(drop_composer(text)) if row['agent'] else ''
-                return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()}, 'options': models()})
+                    if row['state'] == 'exited':
+                        row.pop('_agent_process', None)
+                        continue
+                    text = session_snapshot(row, capture(row['name']))
+                    if row['agent'] and row['agent'] != 'pi':
+                        row['preview'] = last_request(drop_composer(text, row['agent']))
+                return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()},
+                                        'options': models(), 'usage_supported': True})
+            match = re.fullmatch(r'/api/usage/(codex|claude)', path)
+            if match:
+                agent = match.group(1)
+                reader = model_catalogs.codex_usage if agent == 'codex' else model_catalogs.claude_usage
+                return self.reply(200, reader(AGENTS[agent]['command'], Path.home()))
+            match = re.fullmatch(r'/api/sessions/([^/]+)/options', path)
+            if match:
+                session = find_session(match.group(1))
+                if not session['agent'] or session['state'] == 'exited':
+                    return self.reply(409, {'error': 'Agent 没有在这个会话里运行'})
+                if session['agent'] == 'pi':
+                    return self.reply(409, {'error': 'Pi 使用终端里的 /model 和 /thinking 菜单'})
+                return self.reply(200, model_options(session))
             match = re.fullmatch(r'/api/sessions/([^/]+)/output', path)
             if match:
                 session = find_session(match.group(1))
-                text = capture(session['name'])
-                session['state'] = 'exited' if session['state'] == 'exited' else ('busy' if busy(text) else 'idle')
-                session['choice'] = session['state'] != 'exited' and choice_menu(text)
-                cleaned = clean(text)
+                cleaned = session_snapshot(session, capture(session['name']))
                 if session.get('agent') and session['state'] != 'exited':
-                    cleaned = drop_composer(cleaned)
+                    cleaned = drop_composer(cleaned, session['agent'])
                 # The phone polls every second; when the screen is unchanged only the small session header is sent.
                 version = hashlib.sha1(cleaned.encode()).hexdigest()[:16]
                 reply = {'session': session, 'version': version}
@@ -678,10 +1172,21 @@ class Handler(BaseHTTPRequestHandler):
                         sent = seen_messages.setdefault(name, [])
                         if message_id and message_id in sent:
                             return self.reply(200, {'duplicate': True})
+                    if session['agent'] == 'codex' and codex_usage_view(screen(name)):
+                        return self.reply(409, {'code': 'CODEX_USAGE_OPEN',
+                                                'error': '未发送。请点「Esc」退出 Codex 用量页后重发。'})
+                    if session['agent'] == 'pi' and pi_picker(screen(name)):
+                        return self.reply(409, {'code': 'PI_PICKER_OPEN', 'error': '未发送。请点 Esc 退出 Pi 选择菜单后重发。'})
+                    if session['agent'] in ('claude', 'codebuddy'):
+                        clear_trust_prompt(name)
+                    with state_lock:
                         sent.append(message_id); del sent[:-200]
                     send_text(name, text)
                 elif action == 'new':
-                    slash(name, AGENTS[session['agent']]['new'])
+                    agent = session['agent']
+                    slash(name, AGENTS[agent]['new'], agent=agent)
+                elif session['agent'] == 'pi':
+                    return self.reply(200, handle_pi_picker(name, action, body))
                 elif action == 'model':
                     set_model(session, body.get('model'))
                 elif action == 'effort':

@@ -1,14 +1,19 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
-const state = { view: 'login', sessions: [], options: {}, agents: {}, current: null, text: null, timer: null, failures: 0, stick: true };
+const state = { view: 'login', sessions: [], options: {}, agents: {}, current: null, text: null, version: null,
+  timer: null, homeTimer: null, pollEpoch: 0, homeRequest: 0, visit: 0, failures: 0, stick: true, usageSupported: false };
 
-async function api(path, body) {
+async function api(path, body, isCurrent = () => true) {
   const options = body === undefined ? { headers: { 'X-Agent-Chat': '1' } }
     : { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat': '1' }, body: JSON.stringify(body) };
   const response = await fetch(path, { ...options, credentials: 'same-origin', cache: 'no-store' });
   const data = await response.json().catch(() => ({}));
-  if (response.status === 401 && path !== '/api/login') { show('login'); throw new Error('请先登录'); }
-  if (!response.ok) throw new Error(data.error || '请求失败（' + response.status + '）');
+  if (response.status === 401 && path !== '/api/login') { if (isCurrent()) show('login'); throw new Error('请先登录'); }
+  if (!response.ok) {
+    const error = new Error(data.error || '请求失败（' + response.status + '）');
+    error.code = data.code;
+    throw error;
+  }
   return data;
 }
 
@@ -20,13 +25,19 @@ function layout() {
   $('empty').classList.toggle('on', wideQuery.matches && state.view === 'home');
 }
 wideQuery.addEventListener('change', () => { layout(); if (state.view !== 'login') pollHome(); });
+function stopPolling() {
+  // 清掉定时器，并让已发出的请求失效。同名会话重进或从后台恢复也会开启新一轮。
+  state.pollEpoch++;
+  clearTimeout(state.timer); clearTimeout(state.homeTimer);
+}
 function show(view) {
+  stopPolling();
+  if (view !== state.view && $('sheet').open) $('sheet').close();
   state.view = view;
-  if (view === 'home') state.current = null;
+  if (view !== 'chat') { state.current = null; state.visit++; }
   for (const name of ['login', 'home', 'chat']) $(name).classList.toggle('on', name === view);
-  clearTimeout(state.timer);
   layout();
-  if (view === 'home' || (view === 'chat' && wideQuery.matches)) pollHome();
+  if (listVisible()) pollHome();
   if (view === 'chat') pollChat();
 }
 
@@ -34,30 +45,75 @@ function esc(text) { return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp
 function stateLabel(s) { return { busy: '运行中', idle: '空闲', exited: 'Agent 未运行' }[s] || '未知'; }
 
 // ---- home ----
+function listVisible() { return state.view === 'home' || (state.view === 'chat' && wideQuery.matches); }
 async function pollHome() {
   clearTimeout(state.homeTimer);
-  if (state.view !== 'home' && !(state.view === 'chat' && wideQuery.matches)) return;
+  if (!listVisible() || document.hidden) return;
+  const epoch = state.pollEpoch, request = ++state.homeRequest;
+  const isCurrent = () => epoch === state.pollEpoch && request === state.homeRequest && listVisible() && !document.hidden;
   try {
-    const data = await api('/api/sessions');
-    Object.assign(state, { sessions: data.sessions, options: data.options, agents: data.agents });
-    // Each card is rewritten only when it changed: replacing a card while a finger is on it swallows the tap.
-    const cards = data.sessions.map((s) => [s.name, `<div class="card${state.current && state.current.name === s.name ? ' current' : ''}" data-name="${esc(s.name)}"><span class="dot ${s.state}"></span><div class="main"><b>${esc(s.nickname)}</b><span class="muted">${esc(s.name)} · ${stateLabel(s.state)}${s.attached ? ' · 终端已连接' : ''}</span>${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ''}</div><span class="tag">${esc(s.agent_label)}</span></div>`]);
-    const list = $('list'), shown = [...list.querySelectorAll('.card')];
-    if (tapActive()) { /* a finger is on a card: leave the list alone until the next refresh */ }
-    else if (!cards.length || shown.length !== cards.length || shown.some((el, n) => el.dataset.name !== cards[n][0])) {
-      list.innerHTML = cards.map((c) => c[1]).join('') || '<p class="muted">还没有 tmux 会话，点右上角「新建」。</p>';
-      for (const [n, el] of [...list.querySelectorAll('.card')].entries()) el.dataset.html = cards[n][1];
-    } else shown.forEach((el, n) => {
-      if (el.dataset.html === cards[n][1]) return;
-      el.insertAdjacentHTML('afterend', cards[n][1]); el.nextElementSibling.dataset.html = cards[n][1]; el.remove();
-    });
+    const data = await api('/api/sessions', undefined, isCurrent);
+    if (!isCurrent()) return;
+    Object.assign(state, { sessions: data.sessions, options: data.options, agents: data.agents, usageSupported: data.usage_supported === true });
+    for (const session of data.sessions) {
+      if (session.name !== state.current?.name) recordReply(session, false);
+    }
+    renderCards();
     $('home-status').textContent = '';
-  } catch (error) { $('home-status').textContent = '连接中断，正在重试… ' + error.message; }
-  if (!document.hidden) state.homeTimer = setTimeout(pollHome, 3000);
+  } catch (error) {
+    if (!isCurrent()) return;
+    $('home-status').textContent = '连接中断，正在重试… ' + error.message;
+  }
+  state.homeTimer = setTimeout(pollHome, 3000);
+}
+function renderCards() {
+  // 手指按在卡片上时保留原节点，否则会吞掉触摸。
+  if (tapActive()) return;
+  const cards = state.sessions.map((s) => {
+    const unread = hasUnread(s) ? '<span class="dot unread" role="img" aria-label="有未读消息" title="有未读消息"></span>' : '';
+    return [s.name, `<div class="card${state.current?.name === s.name ? ' current' : ''}" data-name="${esc(s.name)}"><span class="dot ${s.state}"></span><div class="main"><b>${esc(s.nickname)}</b><span class="muted">${esc(s.name)} · ${stateLabel(s.state)}${s.attached ? ' · 终端已连接' : ''}</span>${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ''}</div>${unread}<span class="tag">${esc(s.agent_label)}</span></div>`];
+  });
+  const list = $('list'), shown = [...list.querySelectorAll('.card')];
+  if (!cards.length || shown.length !== cards.length || shown.some((el, n) => el.dataset.name !== cards[n][0])) {
+    list.innerHTML = cards.map((c) => c[1]).join('') || '<p class="muted">还没有 tmux 会话，点右上角「新建」。</p>';
+    for (const [n, el] of [...list.querySelectorAll('.card')].entries()) el.dataset.html = cards[n][1];
+  } else shown.forEach((el, n) => {
+    if (el.dataset.html === cards[n][1]) return;
+    el.insertAdjacentHTML('afterend', cards[n][1]); el.nextElementSibling.dataset.html = cards[n][1]; el.remove();
+  });
+}
+
+const observedReplies = new Map(), observingSince = Date.now();
+let readReplies = {};
+try { readReplies = JSON.parse(localStorage.getItem('agentChatReadReplies')) || {}; } catch (_) {}
+function sessionKey(s) { return s.name + ':' + s.created; }
+function hasUnread(s) {
+  const key = sessionKey(s), reply = observedReplies.get(key), seen = readReplies[key];
+  return !!(s.agent && reply?.id && (reply.scope !== seen?.scope || reply.id !== seen?.id));
+}
+function recordReply(s, read) {
+  // Metadata is independent of the rendered text and arrives even with an unchanged output version.
+  // Pi can journal the final message just before its editor stops showing the spinner.
+  const reply = s.reply;
+  if (!s.agent || !reply || (s.agent === 'pi' && s.state !== 'idle')) return false;
+  const key = sessionKey(s), wasUnread = hasUnread(s), seen = readReplies[key];
+  observedReplies.set(key, reply);
+  const initialHistory = reply.scope !== seen?.scope && (!reply.at || reply.at < observingSince);
+  const scopeChanged = reply.scope !== seen?.scope;
+  // If the first reply completed during this visit, persist an unread baseline for reloads.
+  const id = read || initialHistory || !reply.id ? reply.id : scopeChanged ? null : seen.id;
+  if (scopeChanged || id !== seen?.id) {
+    readReplies[key] = { scope: reply.scope, id };
+    try { localStorage.setItem('agentChatReadReplies', JSON.stringify(readReplies)); } catch (_) {}
+  }
+  return wasUnread !== hasUnread(s);
 }
 function openCard(card) {
-  state.current = state.sessions.find((s) => s.name === card.dataset.name); state.text = null; state.stick = true;
-  $('log').innerHTML = ''; renderHeader(); show('chat');
+  const session = state.sessions.find((s) => s.name === card.dataset.name);
+  if (!session) return;
+  state.current = session; state.visit++;
+  state.text = null; state.version = null; state.stick = true; state.failures = 0;
+  $('log').innerHTML = ''; setStatus(''); renderHeader(); show('chat');
   for (const el of $('list').querySelectorAll('.card')) el.classList.toggle('current', el === card);
 }
 $('list').addEventListener('click', (event) => { const card = event.target.closest('.card'); if (card) openCard(card); });
@@ -81,10 +137,12 @@ $('list').addEventListener('touchend', (event) => {
 function renderHeader() {
   const s = state.current; if (!s) return;
   $('chat-name').textContent = s.nickname;
-  $('chat-sub').textContent = [s.agent_label, s.choice ? '等你选择' : stateLabel(s.state), s.model, s.effort].filter(Boolean).join(' · ');
+  const model = state.options[s.agent]?.models.find((o) => o.id === s.model)?.label || s.model;
+  $('chat-sub').textContent = [model?.replace(/\s+/g, '').toLowerCase(), s.effort].filter(Boolean).join(' ');
   $('chat-dot').className = 'dot ' + s.state;
   const usable = !!s.agent && s.state !== 'exited';
   for (const id of ['model', 'effort', 'new']) $(id).disabled = !usable;
+  $('usage').hidden = !state.usageSupported || !usable || !['codex', 'claude', 'pi'].includes(s.agent);
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
   $('send').disabled = s.dead;
   $('input').placeholder = s.choice ? '在这里回复选项（如数字）后发送…' : usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
@@ -132,34 +190,60 @@ $('log').addEventListener('click', async (event) => {
   button.textContent = '已复制'; setTimeout(() => { button.textContent = '复制'; }, 1200);
 });
 function setStatus(text, error = false) { $('status').textContent = text || ''; $('status').classList.toggle('error', error); }
+function outputPath(name, version) {
+  return '/api/sessions/' + encodeURIComponent(name) + '/output' + (version ? '?since=' + version : '');
+}
 async function pollChat() {
-  if (state.view !== 'chat' || !state.current) return;
+  if (state.view !== 'chat' || !state.current || document.hidden) return;
+  const name = state.current.name, epoch = state.pollEpoch;
+  const isCurrent = () => epoch === state.pollEpoch && state.view === 'chat' && state.current?.name === name && !document.hidden;
   let delay = 1000;
   try {
-    const since = state.text === null ? '' : '?since=' + state.version;
-    const data = await api('/api/sessions/' + encodeURIComponent(state.current.name) + '/output' + since);
+    const data = await api(outputPath(name, state.version), undefined, isCurrent);
+    if (!isCurrent()) return;
     state.current = data.session; renderHeader();
-    if (data.text !== undefined && data.text !== state.text) { state.text = data.text; renderLog(data.text); }
+    const textChanged = data.text !== undefined && data.text !== state.text;
+    if (textChanged) { state.text = data.text; renderLog(data.text); }
+    if (recordReply(data.session, true) && listVisible()) renderCards();
     state.version = data.version;
     if (state.failures) setStatus('已重新连接');
     state.failures = 0;
   } catch (error) {
+    if (!isCurrent()) return;
     state.failures += 1; delay = Math.min(8000, 1000 * state.failures);
-    if (/不存在/.test(error.message)) { setStatus(error.message, true); state.timer = setTimeout(() => show('home'), 1500); return; }
+    if (/不存在/.test(error.message)) {
+      setStatus(error.message, true);
+      state.timer = setTimeout(() => { if (isCurrent()) show('home'); }, 1500);
+      return;
+    }
     setStatus('连接中断，正在重连…（Agent 仍在 Mac 上运行）', true);
   }
-  if (document.hidden) return; // in the background nothing is fetched; coming back refreshes at once
   state.timer = setTimeout(pollChat, delay);
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { clearTimeout(state.timer); clearTimeout(state.homeTimer); }
+  if (document.hidden) stopPolling();
   else if (state.view !== 'login') show(state.view);
 });
 
-async function act(action, body, working) {
-  setStatus(working || '处理中…');
-  try { await api('/api/sessions/' + encodeURIComponent(state.current.name) + '/' + action, body || {}); setStatus(''); return true; }
-  catch (error) { setStatus(error.message, true); return false; }
+async function act(action, body, working, visit = state.visit) {
+  const isCurrent = () => state.view === 'chat' && state.visit === visit;
+  const attempts = action === 'send' ? 3 : 1;
+  for (let attempt = 0; attempt < attempts && isCurrent(); attempt++) {
+    setStatus(working || '处理中…');
+    try {
+      await api('/api/sessions/' + encodeURIComponent(state.current.name) + '/' + action, body || {}, isCurrent);
+      if (!isCurrent()) return false;
+      setStatus(''); return true;
+    } catch (error) {
+      if (!isCurrent()) return false;
+      setStatus(error.message, true);
+      if (error.code === 'CODEX_USAGE_OPEN' || error.code === 'PI_PICKER_OPEN') {
+        $('keys').classList.add('on');
+        return false;
+      }
+    }
+  }
+  return false;
 }
 const input = $('input');
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + 'px'; });
@@ -175,12 +259,12 @@ input.addEventListener('keydown', (event) => {
 });
 $('compose').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const text = input.value; if (!text.trim() || $('send').disabled) return;
+  const text = input.value, visit = state.visit; if (!text.trim() || $('send').disabled) return;
   // One id per message: a retry after a dropped connection cannot type it into the agent twice.
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
   $('send').disabled = true; state.stick = true;
-  let sent = false;
-  for (let attempt = 0; attempt < 3 && !sent; attempt++) sent = await act('send', { text, id }, '发送中…');
+  const sent = await act('send', { text, id }, '发送中…', visit);
+  if (visit !== state.visit) return;
   if (sent) { input.value = ''; input.style.height = 'auto'; }
   $('send').disabled = false;
 });
@@ -202,39 +286,166 @@ $('keys').addEventListener('click', (event) => { const key = event.target.datase
 $('back').addEventListener('click', () => show('home'));
 
 // ---- sheets ----
-function sheet(title, note, bodyHtml, actions) {
+function sheet(title, note, bodyHtml, actions, onCancel) {
+  const dialog = $('sheet');
+  const cancel = onCancel || (() => dialog.close());
+  dialog.oncancel = onCancel ? (event) => { event.preventDefault(); cancel(); } : null;
   $('sheet-title').textContent = title; $('sheet-note').textContent = note || ''; $('sheet-body').innerHTML = bodyHtml;
   $('sheet-actions').innerHTML = '';
-  for (const [label, handler, cls] of [['取消', () => $('sheet').close(), ''], ...(actions || [])]) {
+  for (const [label, handler, cls] of [['取消', cancel, ''], ...(actions || [])]) {
     const button = document.createElement('button'); button.textContent = label; button.className = cls || ''; button.type = 'button';
     button.addEventListener('click', handler); $('sheet-actions').append(button);
   }
-  $('sheet').showModal();
+  if (!$('sheet').open) $('sheet').showModal();
 }
-function choose(kind) {
-  const s = state.current, options = state.options[s.agent]; if (!options) return;
+function usageResetText(resetAt, now) {
+  if (!Number.isFinite(resetAt) || resetAt <= 0) return '刷新时间未提供';
+  const remainingMs = resetAt * 1000 - now;
+  if (remainingMs <= 0) return '已到刷新时间';
+  const totalMinutes = Math.floor(remainingMs / 60000);
+  if (totalMinutes === 0) return '距离刷新不足 1 分钟';
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor(totalMinutes / 60) % 24;
+  const minutes = totalMinutes % 60;
+  const parts = [days && `${days} 天`, hours && `${hours} 小时`, minutes && `${minutes} 分钟`].filter(Boolean);
+  return '距离刷新 ' + parts.join(' ');
+}
+async function showUsage() {
+  const session = state.current, visit = state.visit;
+  if (!session || $('usage').hidden) return;
+  const isPi = session.agent === 'pi';
+  if (isPi && session.model_provider !== 'openai-codex') {
+    sheet('Pi 模型额度', '', session.model_provider
+      ? '<p>当前模型提供方「' + esc(session.model_provider) + '」未接入额度查询。</p>'
+      : '<p>暂未识别当前模型的提供方，未查询 Codex 额度。</p>');
+    return;
+  }
+  const agent = isPi ? 'codex' : session.agent;
+  const title = (agent === 'codex' ? 'Codex' : 'Claude') + ' 账号额度';
+  const note = isPi ? 'Pi 当前使用 Codex 提供方；这里显示本机 Codex CLI 登录账号的额度。' : '显示 Agent Chat 配置的本机登录额度。';
+  sheet(title, note, '<p class="muted">正在读取额度…</p>');
+  const loading = $('sheet-body').firstElementChild;
+  const isCurrent = () => visit === state.visit && loading.isConnected && $('sheet').open;
+  const hint = agent === 'codex' ? '在 Codex 窗口（不是 Pi）输入 <code>/usage</code>，选择 Redeem reset。操作完后点「按键」里的「Esc」回到对话。'
+    : '免费重置资格和可用次数请查看 <a href="https://claude.ai/settings/usage" target="_blank" rel="noopener noreferrer">Claude 官方用量页</a>。';
+  try {
+    const data = await api('/api/usage/' + agent, undefined, isCurrent);
+    if (!isCurrent()) return;
+    const windows = data.windows.map(({ minutes, used }) => {
+      const duration = minutes % 1440 === 0 ? minutes / 1440 + ' 天' : minutes % 60 === 0 ? minutes / 60 + ' 小时' : minutes + ' 分钟';
+      const remaining = Math.min(100, Math.max(0, 100 - used)).toLocaleString('zh-CN', { maximumFractionDigits: 1 });
+      return `<li>${duration}额度 · 剩余 <b>${remaining}%</b> · <span class="usage-reset"></span></li>`;
+    });
+    const count = agent === 'codex' ? '<p>' + (data.reset_count === null ? '重置次数未返回' : '剩余重置 ' + data.reset_count + ' 次') + '</p>' : '';
+    const account = data.account_label ? '本机登录账号 ' + data.account_label : note;
+    sheet(title, account, (windows.length ? '<ul>' + windows.join('') + '</ul>' : '<p>暂无订阅额度数据。</p>')
+      + count + `<p class="muted">${hint}</p>`);
+    const countdowns = $('sheet-body').querySelectorAll('.usage-reset');
+    function updateCountdowns() {
+      if (!$('sheet').open || !countdowns[0]?.isConnected) return;
+      const now = Date.now();
+      let pending = false;
+      data.windows.forEach(({ reset_at }, index) => {
+        const countdown = countdowns[index];
+        const label = usageResetText(reset_at, now);
+        if (countdown.textContent !== label) countdown.textContent = label;
+        pending ||= Number.isFinite(reset_at) && reset_at * 1000 > now;
+      });
+      if (pending) setTimeout(updateCountdowns, 1000);
+    }
+    updateCountdowns();
+  } catch (error) {
+    if (isCurrent()) sheet(title, note, `<p>${esc(error.message)}</p><p class="muted">${hint}</p>`);
+  }
+}
+$('usage').addEventListener('click', showUsage);
+
+async function choosePi(kind, title, name, visit) {
+  if (input.value.trim()) { setStatus('请先发送或清空草稿', true); return; }
+  setStatus('');
+  const path = '/api/sessions/' + encodeURIComponent(name) + '/' + kind;
+  const dialog = $('sheet'), body = $('sheet-body');
+  const isCurrent = () => visit === state.visit && dialog.open && body.onclick === click;
+  const note = '仅本会话生效，不修改默认设置。';
+  let pending;
+  const click = (event) => {
+    const button = event.target.closest('[data-pi-pick]');
+    if (button && !pending) load({ op: button.dataset.piPick, id: button.value });
+  };
+  async function load(request) {
+    body.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+    const result = api(path, request, isCurrent);
+    pending = result;
+    try {
+      const picker = await result;
+      if (!isCurrent()) return;
+      if (request.op === 'select') { body.onclick = null; dialog.close(); return; }
+      const page = picker.position ? `<div class="row"><button data-pi-pick="prev">上一页</button><span>${esc(picker.position)}</span><button data-pi-pick="next">下一页</button></div>` : '';
+      body.innerHTML = `<div class="options">${picker.options.map((o) => `<button type="button" data-pi-pick="select" value="${esc(o.id)}"${o.current ? ' class="current" aria-current="true"' : ''}>${esc(o.label)} <small class="muted">${esc(o.detail)}${o.current ? ' · 当前' : ''}</small></button>`).join('') || '<p class="muted">没有可选项。</p>'}</div>${page}`;
+    } catch (error) {
+      if (isCurrent()) body.innerHTML = `<p>${esc(error.message)}</p>`;
+    } finally { pending = null; }
+  }
+  sheet(title, note, '<p class="muted">正在读取 Pi 的选项…</p>', [], async () => {
+    const stillCurrent = () => visit === state.visit && !dialog.open;
+    body.onclick = null;
+    dialog.close();
+    try { await pending; } catch (_) {}
+    if (dialog.open || state.view === 'login') return;
+    try { await api(path, { op: 'cancel' }, stillCurrent); }
+    catch (error) { if (stillCurrent()) setStatus(error.message, true); }
+  });
+  body.onclick = click;
+  await load({ op: 'open' });
+}
+
+async function choose(kind) {
+  const s = state.current, visit = state.visit;
+  const title = kind === 'model' ? '选择模型' : '选择推理深度';
+  if (s.agent === 'pi') return choosePi(kind, title, s.name, visit);
+  let options = state.options[s.agent];
+  if (kind === 'model' || s.agent === 'codex') {
+    sheet(title, '', '<p class="muted">正在读取可用选项…</p>');
+    const loading = $('sheet-body').firstElementChild;
+    try {
+      options = await api('/api/sessions/' + encodeURIComponent(s.name) + '/options', undefined, () => visit === state.visit);
+    } catch (error) {
+      if (loading.isConnected && $('sheet').open && visit === state.visit) loading.textContent = error.message;
+      return;
+    }
+    if (!loading.isConnected || !$('sheet').open || visit !== state.visit) return;
+  }
+  if (!options) return;
   const list = kind === 'model' ? options.models : options.efforts;
-  sheet(kind === 'model' ? '选择模型' : '选择推理深度', kind === 'model' ? '仅本会话生效，不改其他会话的默认模型。切换约需几秒。' : options.effort_note,
-    '<div class="options">' + list.map((o) => `<button type="button" data-id="${esc(o.id)}" class="${s[kind] === o.id ? 'current' : ''}">${esc(o.label)}</button>`).join('') + '</div>');
+  const current = options.current || s;
+  sheet(title, kind === 'model' ? '仅本会话生效，不改其他会话的默认模型。切换约需几秒。' : options.effort_note,
+    list.length ? '<div class="options">' + list.map((o) => `<button type="button" data-id="${esc(o.id)}" class="${current[kind] === o.id ? 'current' : ''}">${esc(o.label)}</button>`).join('') + '</div>'
+      : '<p class="muted">当前模型没有可切换的推理档位。</p>');
   $('sheet-body').onclick = async (event) => {
     const id = event.target.dataset.id; if (!id) return;
     $('sheet').close(); state.stick = true;
-    await act(kind, { [kind]: id }, '正在切换到 ' + id + '…');
+    await act(kind, { [kind]: id }, '正在切换到 ' + id + '…', visit);
   };
 }
 $('model').addEventListener('click', () => choose('model'));
 $('effort').addEventListener('click', () => choose('effort'));
-$('new').addEventListener('click', () => sheet('开启新对话？', '当前 Agent 清空上下文开始新对话，tmux 会话保留。', '', [['开启', async () => { $('sheet').close(); await act('new', {}, '正在开启新对话…'); }, 'primary']]));
+$('new').addEventListener('click', () => {
+  const visit = state.visit;
+  sheet('开启新对话？', '当前 Agent 清空上下文开始新对话，tmux 会话保留。', '', [['开启', async () => {
+    $('sheet').close(); await act('new', {}, '正在开启新对话…', visit);
+  }, 'primary']]);
+});
 $('kill').addEventListener('click', () => {
-  const s = state.current;
+  const s = state.current, visit = state.visit;
   sheet('关闭 tmux 会话？', '将终止「' + s.nickname + '」（' + s.name + '）和其中运行的 Agent，无法恢复。', '', [['确认关闭', async () => {
-    $('sheet').close(); if (await act('kill', { confirm: s.name }, '正在关闭…')) show('home');
+    $('sheet').close(); if (await act('kill', { confirm: s.name }, '正在关闭…', visit)) show('home');
   }, 'danger']]);
 });
 $('rename').addEventListener('click', () => {
-  const s = state.current;
+  const s = state.current, visit = state.visit;
   sheet('修改昵称', '只改网页里显示的名字，不改 tmux 会话名（' + s.name + '）。', `<input id="nick" maxlength="40" value="${esc(s.nickname)}">`, [['保存', async () => {
-    const nickname = $('nick').value; $('sheet').close(); if (await act('rename', { nickname })) { s.nickname = nickname.trim() || s.name; renderHeader(); }
+    const nickname = $('nick').value; $('sheet').close();
+    if (await act('rename', { nickname }, undefined, visit)) { state.current.nickname = nickname.trim() || s.name; renderHeader(); }
   }, 'primary']]);
 });
 $('create-open').addEventListener('click', () => {
@@ -242,10 +453,9 @@ $('create-open').addEventListener('click', () => {
     + '<option value="shell">Zsh</option>';
   sheet('新建 Agent 会话', '在主目录 ~ 下启动一个新的 tmux 长对话。', `<p><select id="new-agent">${agents}</select></p><input id="new-nick" maxlength="40" placeholder="昵称">`, [['创建', async () => {
     const body = { agent: $('new-agent').value, nickname: $('new-nick').value }; $('sheet').close();
-    try { await api('/api/sessions', body); pollHomeNow(); } catch (error) { $('home-status').textContent = error.message; }
+    try { await api('/api/sessions', body); pollHome(); } catch (error) { $('home-status').textContent = error.message; }
   }, 'primary']]);
 });
-function pollHomeNow() { clearTimeout(state.timer); pollHome(); }
 
 // ---- login, or on a fresh install the first password ----
 let firstRun = false;
