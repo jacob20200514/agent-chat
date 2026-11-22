@@ -298,7 +298,24 @@ def drop_composer(text, agent=None):
 
 
 USER_LINE = re.compile(r'^(\s*[❯›]|>)\s+(\S.*)')
-USER_MORE = re.compile(r'^ {2}([^\s└⎿├│⏺●•].*)')
+# Continuation of a message: two spaces plus any indent of the user's own. Replies that are indented too start
+# with a tree glyph or a dot; Codex shows the user's "- " as "•".
+USER_MORE = re.compile(r'^ {2}(\s*[^\s└⎿├│⏺●].*)')
+MENU_HINT = re.compile(r'\b(?:enter|esc)\b.*\b(?:select|confirm|cancel|back|exit)\b', re.I)
+REPLY_OR_PROMPT = re.compile(r'^\s*[❯›>⏺●•✻✶✳✢✽·∴✔⎿└](\s|$)')
+
+
+def menu_row(lines, i):
+    """A menu's cursor row ("❯ 1. Yes") is followed by the menu's key hint; a message of the user's that starts
+    with "1." is followed by the reply or the next prompt instead. Same rule as menuRow() in app.js."""
+    if not MENU_ROW.match(lines[i]):
+        return False
+    for line in lines[i + 1:i + 40]:
+        if MENU_HINT.search(line):
+            return True
+        if REPLY_OR_PROMPT.match(line):
+            return False
+    return False
 NEW_CONVERSATION = {agent['new'] for agent in AGENTS.values()}
 
 
@@ -310,7 +327,7 @@ def last_request(text, limit=120):
     lines = text.split('\n')
     for i in range(len(lines) - 1, -1, -1):
         match = USER_LINE.match(lines[i])
-        if not match or MENU_ROW.match(lines[i]):
+        if not match or menu_row(lines, i):
             continue
         if match.group(2).split()[0] in NEW_CONVERSATION:
             return ''
@@ -963,8 +980,9 @@ def create_session(agent, nickname):
 def set_width(session, columns):
     """The CLIs break their own lines at the pane width, so wider text on the page needs a wider pane.
     Codex, CodeBuddy and Pi clear their scrollback and reprint the conversation at the new width. Claude
-    redraws only the screen: its older output keeps the old width and up to a screen of it shows twice.
-    Clearing the history would remove the duplicate but lose everything above the screen (2026-11-22)."""
+    redraws only what it can still reach: its older output keeps the old width, and each switch leaves a
+    second copy of the latest output, from a few lines to the whole last turn. Clearing the history would
+    drop everything above the screen; a temporarily taller window still left copies (2026-11-22)."""
     if type(columns) is not int:
         raise ValueError('columns')
     columns = max(AGENTS[session['agent']]['width'], min(WIDE_MAX, columns))

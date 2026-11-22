@@ -68,7 +68,7 @@ dialog::backdrop { background:rgba(0,0,0,.5); }
 dialog h3 { margin:0 0 10px; }
 .options { display:grid; gap:8px; max-height:52dvh; overflow:auto; margin:10px 0; }
 .options button { text-align:left; }
-.options button.current, #width[aria-pressed="true"] { border-color:var(--accent); }
+.options button.current { border-color:var(--accent); }
 .row { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
 /* Desktop: the session list stays as a sidebar beside the chat; buttons keep their natural width. */
 body.wide #home.on, body.wide #home.side { display:flex; position:fixed; inset:0 auto 0 0; width:300px; border-right:1px solid var(--line); }
@@ -110,7 +110,7 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
 <p id="empty" class="muted">从左侧选择一个会话，或点「新建」。</p>
 
 <section id="chat" class="view">
-  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button id="font-down" aria-label="字体变小">−</button><button id="font-up" aria-label="字体变大">+</button><button id="width" type="button" aria-pressed="false" title="宽屏：按窗口宽度显示；再点回到手机宽度">宽屏</button><button id="rename">改名</button></header>
+  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button id="font-down" aria-label="字体变小">−</button><button id="font-up" aria-label="字体变大">+</button><button id="width" type="button" title="按窗口宽度显示">宽屏</button><button id="rename">改名</button></header>
   <div class="bar"><button id="model">Model</button><button id="effort">Effort</button><button id="new">New</button><button id="usage" type="button" hidden>额度</button><button id="keys-toggle">按键</button><button id="kill" class="danger">关闭 tmux</button></div>
   <div id="log"></div>
   <div id="status"></div>

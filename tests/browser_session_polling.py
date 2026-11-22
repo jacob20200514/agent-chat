@@ -312,7 +312,7 @@ async function run() {
   check(document.querySelector('#font-up').nextElementSibling === widthButton && !widthButton.disabled &&
     widthButton.getBoundingClientRect().height === document.querySelector('#rename').getBoundingClientRect().height,
     'width button is not beside the text size buttons or differs from them');
-  check(widthButton.getAttribute('aria-pressed') === 'false', 'a phone-width pane showed as wide');
+  check(widthButton.textContent === '宽屏', 'a phone-width pane did not offer to widen');
   const lineHeight = (columns) => {
     const block = document.createElement('div');
     block.className = 'block agent'; block.innerHTML = '<pre>' + '0'.repeat(columns) + '</pre>';
@@ -327,10 +327,9 @@ async function run() {
     const columns = widthCalls()[0].body.columns;
     check(Number.isInteger(columns) && lineHeight(columns) === lineHeight(1) && lineHeight(columns + 2) > lineHeight(1),
       'fitted width does not match the window: ' + columns);
-    await until(() => widthButton.getAttribute('aria-pressed') === 'true', 'wide mode was not shown');
-    check(getComputedStyle(widthButton).borderColor === 'rgb(16, 163, 127)', 'wide mode is not marked like a current choice');
+    await until(() => widthButton.textContent === '窄屏', 'a wide pane did not offer the phone width');
     widthButton.click();
-    await until(() => widthCalls().length === 2 && widthButton.getAttribute('aria-pressed') === 'false', 'phone width was not restored');
+    await until(() => widthCalls().length === 2 && widthButton.textContent === '宽屏', 'phone width was not restored');
     check(widthCalls()[1].body.columns === 46, 'narrow mode did not return to the phone width');
   } else {
     check(!document.body.classList.contains('wide') && lineHeight(47) > lineHeight(1), 'a screen with room to widen refused');
@@ -344,6 +343,15 @@ async function run() {
     check(widthCalls().length === before && lineHeight(47) > lineHeight(1), 'a narrow screen posted a width');
     for (let i = 0; i < 10; i++) document.querySelector('#font-down').click();
   }
+
+  // The user's message stays one bubble when it starts with "1." or has indented lines; a menu's "❯ 1." row
+  // (its key hint follows) stays with the agent's question.
+  output.B = ['b9', '❯ 1. 第一项\n  2. 第二项\n     缩进的补充说明\n\n⏺ 收到\n\n❯ 看这个：\n  code line\n      indented code\n  只回复收到' +
+    '\n\n⏺ 收到\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel · Tab to amend'];
+  await until(() => message().includes('Esc to cancel'), 'B did not render the message fixture');
+  const bubbles = [...document.querySelectorAll('#log .block.user')].map((b) => b.dataset.text);
+  check(JSON.stringify(bubbles) === JSON.stringify(['1. 第一项\n2. 第二项\n   缩进的补充说明', '看这个：\ncode line\n    indented code\n只回复收到']),
+    'user bubbles are split wrongly: ' + JSON.stringify(bubbles));
 }
 window.addEventListener('load', async () => {
   const result = document.body.appendChild(document.createElement('pre'));

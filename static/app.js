@@ -142,7 +142,10 @@ function renderHeader() {
   $('chat-dot').className = 'dot ' + s.state;
   const usable = !!s.agent && s.state !== 'exited';
   for (const id of ['model', 'effort', 'new']) $(id).disabled = !usable;
-  $('width').disabled = !usable; $('width').setAttribute('aria-pressed', String(s.width > s.default_width));
+  // The button names what a click does: widen a phone-width pane, or bring a wide one back.
+  const wide = s.width > s.default_width;
+  $('width').disabled = !usable; $('width').textContent = wide ? '窄屏' : '宽屏';
+  $('width').title = wide ? '回到手机宽度' : '按窗口宽度显示';
   $('usage').hidden = !state.usageSupported || !usable || !['codex', 'claude', 'pi'].includes(s.agent);
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
   $('send').disabled = s.dead;
@@ -150,21 +153,35 @@ function renderHeader() {
 }
 // The pane is one stream of text. Lines the CLI marks as the user's prompt become right-hand bubbles and
 // split it into blocks, so each stretch of agent output can be copied on its own.
+// A menu's cursor row ("❯ 1. Yes") carries the prompt mark too and belongs to the agent's question: its key hint
+// ("Enter to select", "Esc to cancel", "esc back") follows. A message of the user's that starts with "1." is
+// followed by the reply or the next prompt instead. Same rule as menu_row() in server.py.
+const MENU_HINT = /\b(?:enter|esc)\b.*\b(?:select|confirm|cancel|back|exit)\b/i;
+function menuRow(lines, i) {
+  if (!/^\s*[❯›>]\s+\d+\.\s/.test(lines[i])) return false;
+  for (const line of lines.slice(i + 1, i + 40)) {
+    if (MENU_HINT.test(line)) return true;
+    if (/^\s*[❯›>⏺●•✻✶✳✢✽·∴✔⎿└](\s|$)/.test(line)) return false;
+  }
+  return false;
+}
+// A long or multi-line message continues on lines indented two spaces, plus any indent of the user's own.
+// Replies that are indented too start with a tree glyph (└ ⎿) or a dot (⏺ ●); Codex shows the user's "- " as "•".
+const moreOfMessage = (line) => /^ {2}\s*[^\s└⎿├│⏺●]/.test(line || '');
 function blocks(text) {
   const out = []; let current = null;
   const push = (kind, line) => { if (!current || current.kind !== kind) { current = { kind, lines: [] }; out.push(current); } current.lines.push(line); };
+  const lines = text.split('\n');
   let inUser = false;
-  for (const line of text.split('\n')) {
-    // A menu's cursor row ("❯ 1. Yes") carries the prompt mark too; it belongs to the agent's question.
-    const user = (/^\s*[❯›]\s+\S/.test(line) || /^>\s+\S/.test(line)) && !/^\s*[❯›>]\s+\d+\.\s/.test(line);
-    // A long or multi-line message continues on lines indented two spaces, up to the first empty line;
-    // CodeBuddy's replies are indented too but start with a tree glyph (└ ⎿).
-    if (inUser && !user && /^ {2}[^\s└⎿├│⏺●•]/.test(line)) { current.lines.push(line.slice(2)); continue; }
+  lines.forEach((line, i) => {
+    const user = (/^\s*[❯›]\s+\S/.test(line) || /^>\s+\S/.test(line)) && !menuRow(lines, i);
+    if (inUser && !user && moreOfMessage(line)) { current.lines.push(line.slice(2)); return; }
     // A blank line inside the message arrives as two spaces (server.py PADDED_BLANK); a truly empty line ends it.
-    if (inUser && line === '  ') { current.lines.push(''); continue; }
+    // Codex leaves blank lines inside a message truly empty, like the gap under its input box, so they end it too.
+    if (inUser && line === '  ') { current.lines.push(''); return; }
     inUser = user;
     if (user) { current = null; push('user', line.replace(/^\s*[❯›>]\s+/, '')); } else push('agent', line === '  ' ? '' : line);
-  }
+  });
   return out.map((b) => ({ kind: b.kind, text: b.lines.join('\n').replace(/^\n+|\n+$/g, '') })).filter((b) => b.text.trim());
 }
 function renderLog(text) {
