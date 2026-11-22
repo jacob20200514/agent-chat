@@ -12,7 +12,7 @@ HARNESS = r"""
 <script>
 const rows = Object.fromEntries(['A', 'B'].map((name) => [name, {
   name, nickname: '会话' + name, agent: name === 'A' ? 'claude' : 'codex', agent_label: name === 'A' ? 'Claude' : 'Codex',
-  created: 1, state: 'idle', dead: false, reply: {scope: name, id: 'old', at: Date.now() - 60000},
+  created: 1, state: 'idle', dead: false, reply: {scope: name, id: 'old', at: Date.now() - 60000}, width: 46, default_width: 46,
 }]));
 const output = {A: ['a1', 'A 的旧回复'], B: ['b1', 'B 的旧回复']};
 const calls = [], usageReads = [];
@@ -55,6 +55,10 @@ window.fetch = async (url, options) => {
     ] : [{id: 'medium', label: 'medium', detail: 'Moderate reasoning', current: true}] });
     if (call.body.op === 'select') rows.P.model = call.body.id.split('/').at(-1);
     return response({});
+  }
+  if (action === 'width') {
+    rows[name].width = Math.max(rows[name].default_width, Math.min(120, call.body.columns));
+    return response({width: rows[name].width});
   }
   if (action !== 'output') throw Error('unexpected request ' + url);
   const [version, text] = output[name]; call.version = version;
@@ -299,6 +303,47 @@ async function run() {
   rows.B.reply = {scope: 'B', id: 'completed', at: Date.now()};
   await until(() => dot('B'), 'completed Codex reply was missed');
   check(!calls.some((c) => c.action === 'output' && !c.active), 'list still fetched full output for unread');
+
+  // Wide mode: the pane is fitted to the window (one line of that many columns fits an agent block, two more
+  // do not); the same button returns to the phone width. A screen too narrow for more columns posts nothing.
+  open('B');
+  await until(() => title() === '会话B', 'B did not open for the width toggle');
+  const widthButton = document.querySelector('#width'), widthCalls = () => calls.filter((c) => c.action === 'width');
+  check(document.querySelector('#font-up').nextElementSibling === widthButton && !widthButton.disabled &&
+    widthButton.getBoundingClientRect().height === document.querySelector('#rename').getBoundingClientRect().height,
+    'width button is not beside the text size buttons or differs from them');
+  check(widthButton.getAttribute('aria-pressed') === 'false', 'a phone-width pane showed as wide');
+  const lineHeight = (columns) => {
+    const block = document.createElement('div');
+    block.className = 'block agent'; block.innerHTML = '<pre>' + '0'.repeat(columns) + '</pre>';
+    document.querySelector('#log').append(block);
+    const height = block.firstChild.getBoundingClientRect().height;
+    block.remove();
+    return height;
+  };
+  widthButton.click();
+  await until(() => widthCalls().length || document.querySelector('#status.error')?.textContent.includes('窗口不够宽'), 'width click did nothing');
+  if (widthCalls().length) {
+    const columns = widthCalls()[0].body.columns;
+    check(Number.isInteger(columns) && lineHeight(columns) === lineHeight(1) && lineHeight(columns + 2) > lineHeight(1),
+      'fitted width does not match the window: ' + columns);
+    await until(() => widthButton.getAttribute('aria-pressed') === 'true', 'wide mode was not shown');
+    check(getComputedStyle(widthButton).borderColor === 'rgb(16, 163, 127)', 'wide mode is not marked like a current choice');
+    widthButton.click();
+    await until(() => widthCalls().length === 2 && widthButton.getAttribute('aria-pressed') === 'false', 'phone width was not restored');
+    check(widthCalls()[1].body.columns === 46, 'narrow mode did not return to the phone width');
+  } else {
+    check(!document.body.classList.contains('wide') && lineHeight(47) > lineHeight(1), 'a screen with room to widen refused');
+  }
+  if (!document.body.classList.contains('wide')) {
+    // At the largest text size a phone layout has no room beyond 46 columns: nothing is posted.
+    for (let i = 0; i < 10; i++) document.querySelector('#font-up').click();
+    const before = widthCalls().length;
+    widthButton.click();
+    await until(() => document.querySelector('#status.error')?.textContent.includes('窗口不够宽'), 'a narrow screen tried to widen');
+    check(widthCalls().length === before && lineHeight(47) > lineHeight(1), 'a narrow screen posted a width');
+    for (let i = 0; i < 10; i++) document.querySelector('#font-down').click();
+  }
 }
 window.addEventListener('load', async () => {
   const result = document.body.appendChild(document.createElement('pre'));
