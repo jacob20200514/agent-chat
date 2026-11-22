@@ -485,6 +485,13 @@ def codex_usage_view(text):
     return bool(title and footer)
 
 
+def codex_warnings_view(text):
+    """Match the open F2 panel, whose footer takes over the chat input."""
+    title = re.search(r'(?m)^[ \t]*Warnings · \d+ of \d+(?: ·[^\n]*)?[ \t]*$', text)
+    footer = re.search(r'(?m)^[ \t]*k keep & next · esc dismiss & close\s*\Z', text)
+    return bool(title and footer)
+
+
 MODEL_FOOTER = re.compile(r'\s*([A-Za-z0-9][A-Za-z0-9_. -]*?)\s+(minimal|low|medium|high|xhigh|max|ultra)\s+·(?:\s.*)?', re.I)
 CLAUDE_MODEL_LABEL = re.compile(r'\b((?:Opus|Sonnet|Fable|Haiku)\s+\d+(?:\.\d+)*)\b', re.I)
 PI_FOOTER = re.compile(r'(?:^|\s)(?:\?|\d+(?:\.\d+)?%)/\S+(?: \(auto\))?(?: • xp)? {2,}'
@@ -1172,9 +1179,14 @@ class Handler(BaseHTTPRequestHandler):
                         sent = seen_messages.setdefault(name, [])
                         if message_id and message_id in sent:
                             return self.reply(200, {'duplicate': True})
-                    if session['agent'] == 'codex' and codex_usage_view(screen(name)):
-                        return self.reply(409, {'code': 'CODEX_USAGE_OPEN',
-                                                'error': '未发送。请点「Esc」退出 Codex 用量页后重发。'})
+                    if session['agent'] == 'codex':
+                        view = screen(name)
+                        if codex_warnings_view(view):
+                            return self.reply(409, {'code': 'CODEX_WARNINGS_OPEN',
+                                                    'error': '未发送。请点「Esc」退出 Codex 警告面板后重发。'})
+                        if codex_usage_view(view):
+                            return self.reply(409, {'code': 'CODEX_USAGE_OPEN',
+                                                    'error': '未发送。请点「Esc」退出 Codex 用量页后重发。'})
                     if session['agent'] == 'pi' and pi_picker(screen(name)):
                         return self.reply(409, {'code': 'PI_PICKER_OPEN', 'error': '未发送。请点 Esc 退出 Pi 选择菜单后重发。'})
                     if session['agent'] in ('claude', 'codebuddy'):

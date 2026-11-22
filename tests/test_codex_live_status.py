@@ -117,6 +117,29 @@ class CodexLiveStatus(unittest.TestCase):
             self.assertEqual(self.request(path, payload), {'duplicate': True})
             send.assert_called_once()
 
+    def test_send_keeps_the_message_unsent_until_codex_warnings_are_closed(self):
+        warning = ('  Warnings · 1 of 1 · Startup\n\n'
+                   '  Running without the shared background\n'
+                   '  server: command-line configuration\n'
+                   '  overrides (-c, --enable, --disable, or\n'
+                   '  --search) requires embedded mode.\n\n\n'
+                   '  k keep & next · esc dismiss & close\n\n')
+        path = '/api/sessions/codex-test/send'
+        payload = {'id': 'draft-1', 'text': '继续上一项'}
+        with patch.object(self.server, 'seen_messages', {}), \
+                patch.object(self.server, 'screen', return_value=warning) as screen, \
+                patch.object(self.server, 'send_text') as send:
+            with self.assertRaises(HTTPError) as failure:
+                self.request(path, payload)
+            with failure.exception as response:
+                self.assertEqual(response.code, 409)
+                self.assertEqual(json.load(response)['code'], 'CODEX_WARNINGS_OPEN')
+            send.assert_not_called()
+
+            screen.return_value = warning + pane() + '  ⚠ 1 warning · f2 to view\n'
+            self.assertEqual(self.request(path, payload), {})
+            send.assert_called_once_with('codex-test', payload['text'])
+
     def test_terminal_switch_refreshes_header_even_when_chat_text_is_unchanged(self):
         first = self.get('/api/sessions/codex-test/output')
         self.raw = pane('GPT-6-Astra', 'high')

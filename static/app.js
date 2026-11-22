@@ -237,7 +237,7 @@ async function act(action, body, working, visit = state.visit) {
     } catch (error) {
       if (!isCurrent()) return false;
       setStatus(error.message, true);
-      if (error.code === 'CODEX_USAGE_OPEN' || error.code === 'PI_PICKER_OPEN') {
+      if (['CODEX_USAGE_OPEN', 'CODEX_WARNINGS_OPEN', 'PI_PICKER_OPEN'].includes(error.code)) {
         $('keys').classList.add('on');
         return false;
       }

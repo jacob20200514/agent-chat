@@ -119,27 +119,34 @@ async function run() {
   await until(() => usageText().includes('剩余重置 0 次'), 'a confirmed zero reset count was lost');
   closeSheet();
 
-  pending = defer('B', 'send');
   const compose = document.querySelector('#compose'), draft = document.querySelector('#input');
-  draft.value = '保留这条草稿';
-  compose.requestSubmit();
-  await until(() => pending.release, 'send from the Usage screen was not held');
-  pending.release({code: 'CODEX_USAGE_OPEN', error: '未发送。请点 Esc 退出用量页。'}, 409);
-  await until(() => document.querySelector('#status').textContent.includes('未发送'), 'blocked send was not explained');
-  await sleep(80);
-  check(draft.value === '保留这条草稿' && document.querySelector('#keys.on') &&
-    calls.filter((c) => c.action === 'send').length === 1, 'blocked send lost the draft, hid Esc or retried');
-  pending = defer('B', 'key');
-  document.querySelector('[data-key="Escape"]').click();
-  await until(() => pending.release, 'manual Esc was not sent');
-  check(pending.call.body.key === 'Escape', 'manual Esc sent an unexpected key');
-  pending.release({});
-  pending = defer('B', 'send');
-  compose.requestSubmit();
-  await until(() => pending.release, 'draft was not sent after Esc');
-  check(pending.call.body.text === '保留这条草稿', 'the retried draft was changed');
-  pending.release({});
-  await until(() => !draft.value, 'successful send after Esc did not clear the draft');
+  const esc = document.querySelector('[data-key="Escape"]');
+  for (const [code, panel] of [['CODEX_USAGE_OPEN', '用量页'], ['CODEX_WARNINGS_OPEN', '警告面板']]) {
+    if (document.querySelector('#keys.on')) document.querySelector('#keys-toggle').click();
+    const sendCount = calls.filter((c) => c.action === 'send').length;
+    const keyCount = calls.filter((c) => c.action === 'key').length;
+    pending = defer('B', 'send');
+    draft.value = '保留这条草稿';
+    compose.requestSubmit();
+    await until(() => pending.release, `${panel}: send was not held`);
+    pending.release({code, error: `未发送。请点 Esc 退出${panel}。`}, 409);
+    await until(() => document.querySelector('#status.error')?.textContent.includes('未发送'), `${panel}: blocked send was not explained`);
+    await sleep(80);
+    check(draft.value === '保留这条草稿' && esc.getBoundingClientRect().width > 0 &&
+      calls.filter((c) => c.action === 'send').length === sendCount + 1 &&
+      calls.filter((c) => c.action === 'key').length === keyCount, `${panel}: blocked send lost the draft, hid Esc or sent extra input`);
+    pending = defer('B', 'key');
+    esc.click();
+    await until(() => pending.release, 'manual Esc was not sent');
+    check(pending.call.body.key === 'Escape', 'manual Esc sent an unexpected key');
+    pending.release({});
+    pending = defer('B', 'send');
+    compose.requestSubmit();
+    await until(() => pending.release, 'draft was not sent after Esc');
+    check(pending.call.body.text === '保留这条草稿', 'the retried draft was changed');
+    pending.release({});
+    await until(() => !draft.value, 'successful send after Esc did not clear the draft');
+  }
 
   pending = defer('B');
   await until(() => pending.release, 'old B request was not held');
