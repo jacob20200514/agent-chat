@@ -472,7 +472,8 @@ def pi_transcript(path, modified_ns, size):
             if preview is None and text and not text.startswith('/'):
                 preview = text[:120]
         elif reply is None and msg['role'] == 'assistant' and msg.get('stopReason') == 'stop' and pi_message_text(msg).strip():
-            reply = (entry['id'], entry.get('timestamp'))
+            # The excerpt is kept only while no message of the user's follows the reply.
+            reply = (entry['id'], entry.get('timestamp'), None if asked else reply_status.excerpt(pi_message_text(msg)))
     return preview or '', reply, selection, header.get('id'), tuple(asked)
 
 
@@ -1229,6 +1230,11 @@ class Handler(BaseHTTPRequestHandler):
                     text = session_snapshot(row, capture(row['name']))
                     if row['agent'] and row['agent'] != 'pi':
                         row['preview'] = last_request(drop_composer(text, row['agent']))
+                    # Once the agent has answered, the card shows the start of the answer until the user sends
+                    # the next message (the user's choice, 2026-11-23).
+                    answer = (row.get('reply') or {}).get('excerpt')
+                    if answer and row['state'] == 'idle':
+                        row['preview'] = answer
                 return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()},
                                         'options': models(), 'usage_supported': True})
             match = re.fullmatch(r'/api/usage/(codex|claude)', path)

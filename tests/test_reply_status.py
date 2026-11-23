@@ -45,7 +45,7 @@ class ReplyStatusTest(unittest.TestCase):
         final = assistant('4', 'end_turn', text())
         side = assistant('5', 'end_turn', text(), isSidechain=True)
         self.assertIsNone(self.snapshot('claude', progress, thinking, abort, side, incomplete=final))
-        self.assertEqual(self.snapshot('claude', progress, thinking, final, abort, side), ('4', STAMP))
+        self.assertEqual(self.snapshot('claude', progress, thinking, final, abort, side), ('4', STAMP, 'reply body'))
         self.assertEqual(reply_status.reply_status('c', ('4', STAMP))['at'], STAMP_MS)
 
     def test_codebuddy_waits_for_turn_metrics_after_assistant_output(self):
@@ -58,7 +58,7 @@ class ReplyStatusTest(unittest.TestCase):
         finished = dict(type='turn-metrics', timestamp=STAMP_MS)
         self.assertIsNone(self.snapshot('codebuddy', progress, tool, result, final))
         self.assertIsNone(self.snapshot('codebuddy', progress, tool, result, finished))
-        self.assertEqual(self.snapshot('codebuddy', progress, tool, result, final, finished, progress, tool), ('final', STAMP_MS))
+        self.assertEqual(self.snapshot('codebuddy', progress, tool, result, final, finished, progress, tool), ('final', STAMP_MS, 'reply body'))
         self.assertEqual(reply_status.reply_status('b', ('final', STAMP_MS))['at'], STAMP_MS)
 
     def test_codex_requires_final_answer_and_successful_turn_completion(self):
@@ -75,8 +75,33 @@ class ReplyStatusTest(unittest.TestCase):
         self.assertIsNone(self.snapshot('codex', started, commentary, large_tool_result, finished))
         self.assertIsNone(self.snapshot('codex', started, final, aborted))
         self.assertIsNone(self.snapshot('codex', started, final, incomplete=finished))
+        self.assertEqual(self.snapshot('codex', started, commentary, large_tool_result, final, finished),
+                         ('turn-1', STAMP, 'reply body'))
+        # A later turn means the user asked again: the reply stays read or unread, but its excerpt is gone.
         self.assertEqual(self.snapshot('codex', started, commentary, large_tool_result, final, finished,
-                                       started, commentary, aborted), ('turn-1', STAMP))
+                                       started, commentary, aborted), ('turn-1', STAMP, None))
+
+    def test_excerpt_lasts_until_the_user_sends_the_next_message(self):
+        markdown = '## 结论\n**已修好**，`869c97c` 已推送\n- [打开页面](https://example.com/a)看第二点'
+        final = dict(type='assistant', uuid='4', timestamp=STAMP,
+                     message=dict(role='assistant', stop_reason='end_turn', content=[{'type': 'text', 'text': markdown}]))
+        def claude_user(content, **fields):
+            return dict(type='user', message=dict(role='user', content=content), **fields)
+        human = claude_user('下一条', origin={'kind': 'human'})
+        tool_result = claude_user([{'type': 'tool_result', 'content': 'x'}])
+        command = claude_user('<command-name>/model</command-name>')
+        notice = claude_user('<task-notification>', origin={'kind': 'task-notification'})
+        self.assertEqual(self.snapshot('claude', final, tool_result, command, notice)[2], '结论 已修好，869c97c 已推送 打开页面看第二点')
+        self.assertEqual(self.snapshot('claude', final, human, tool_result), ('4', STAMP, None))
+
+        answer = dict(type='message', role='assistant', status='completed', id='final', content=text('output_text'))
+        finished = dict(type='turn-metrics', timestamp=STAMP_MS)
+        def codebuddy_user(**meta):
+            return dict(type='message', role='user', content=[{'type': 'input_text', 'text': '下一条'}], providerData=meta)
+        for meta, expected in (({'agent': 'cli'}, None), ({'skipRun': True}, 'reply body'),
+                               ({'agent': 'cli', 'isMeta': True}, 'reply body')):
+            with self.subTest(meta=meta):
+                self.assertEqual(self.snapshot('codebuddy', answer, finished, codebuddy_user(**meta)), ('final', STAMP_MS, expected))
 
     def test_codex_process_binding_ignores_other_panes_old_processes_and_subagents(self):
         root = self.home / '.codex'
@@ -95,7 +120,7 @@ class ReplyStatusTest(unittest.TestCase):
             db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, source TEXT)')
             db.executemany('INSERT INTO threads VALUES (?, ?, ?)', [(SID, str(log), 'cli'), ('sub', str(log), 'subagent')])
         self.assertEqual(reply_status.native_status('codex', (99, 100), self.home),
-                         (reply_status.reply_status(f'codex:{SID}', ('a', STAMP)), False))
+                         (reply_status.reply_status(f'codex:{SID}', ('a', STAMP, 'reply body')), False))
         self.assertEqual(reply_status.native_status('codex', (9, 100), self.home), (None, None))
         self.assertEqual(reply_status.native_status('codex', (99, 101), self.home), (None, None))
 

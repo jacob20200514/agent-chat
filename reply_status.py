@@ -20,17 +20,29 @@ SESSION_ID = re.compile(r'[0-9a-f-]{36}', re.I)
 
 
 def reply_status(scope, reply=None):
+    """reply is (id, timestamp[, excerpt]); the excerpt is there only while no message of the user's follows."""
     def digest(value):
         return hashlib.sha256(value.encode()).hexdigest()[:24]
 
-    ident, stamp = reply or (None, None)
+    ident, stamp, *answer = reply or (None, None)
     at = stamp if type(stamp) is int else None  # CodeBuddy uses Unix milliseconds.
     if isinstance(stamp, str):
         try:
             at = int(datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() * 1000)
         except (ValueError, OverflowError):
             pass
-    return {'scope': digest(scope), 'id': digest(f'{scope}:{ident}') if ident else None, 'at': at}
+    status = {'scope': digest(scope), 'id': digest(f'{scope}:{ident}') if ident else None, 'at': at}
+    if answer and answer[0]:
+        status['excerpt'] = answer[0]
+    return status
+
+
+def excerpt(text, limit=120):
+    """The start of a reply for the session list: one line, without Markdown headings, bullets, bold, code marks
+    or link targets."""
+    lines = (re.sub(r'^\s*(?:#+|[-*>])\s+', '', line) for line in text.splitlines())
+    flat = re.sub(r'\[([^\]]+)\]\([^)\s]+\)', r'\1', ' '.join(lines))
+    return ' '.join(flat.replace('**', '').replace('`', '').split())[:limit]
 
 
 def text_block(content, kind):
@@ -38,6 +50,10 @@ def text_block(content, kind):
         isinstance(block, dict) and block.get('type') == kind and (block.get('text') or '').strip()
         for block in content
     )
+
+
+def block_text(content, kind):
+    return '\n'.join(block.get('text') or '' for block in content if isinstance(block, dict) and block.get('type') == kind)
 
 
 def reverse_lines(path):
@@ -74,16 +90,26 @@ def reverse_records(path, needles=()):
 
 @lru_cache(maxsize=48)
 def latest_reply(path, agent, modified_ns, size):
+    """(id, timestamp, excerpt) of the latest final reply. The excerpt is None once the user has asked again, as
+    the CLI records it: Claude marks what the user typed as origin "human"; CodeBuddy marks slash commands,
+    their output and ! shell input skipRun, and task notifications and scheduled prompts isMeta; every Codex
+    turn, which a message of the user's starts, records task_started."""
     completed = None
+    asked = False
     for row in reverse_records(path):
         kind = row.get('type')
         if agent == 'claude':
             msg = row.get('message') or {}
+            if kind == 'user' and (row.get('origin') or {}).get('kind') == 'human':
+                asked = True
             if (kind == 'assistant' and not any(row.get(flag) for flag in ('isSidechain', 'isMeta', 'isApiErrorMessage'))
                     and row.get('uuid') and msg.get('role') == 'assistant' and msg.get('stop_reason') == 'end_turn'
                     and text_block(msg.get('content'), 'text')):
-                return row['uuid'], row.get('timestamp')
+                return row['uuid'], row.get('timestamp'), None if asked else excerpt(block_text(msg['content'], 'text'))
         elif agent == 'codebuddy':
+            meta = row.get('providerData') or {}
+            if kind == 'message' and row.get('role') == 'user' and not meta.get('skipRun') and not meta.get('isMeta'):
+                asked = True
             # An assistant text item is completed at the end of each model call, even
             # before tools run. It is a final reply only at the end of the outer turn.
             if kind == 'turn-metrics':
@@ -92,7 +118,8 @@ def latest_reply(path, agent, modified_ns, size):
                 if (completed and kind == 'message' and row.get('role') == 'assistant'
                         and row.get('status') == 'completed' and row.get('id')
                         and text_block(row.get('content'), 'output_text')):
-                    return row['id'], completed.get('timestamp')
+                    answer = None if asked else excerpt(block_text(row['content'], 'output_text'))
+                    return row['id'], completed.get('timestamp'), answer
                 completed = None
         else:  # codex
             payload = row.get('payload') or {}
@@ -102,10 +129,11 @@ def latest_reply(path, agent, modified_ns, size):
                     completed = (payload.get('turn_id'), row.get('timestamp')) if (payload.get('last_agent_message') or '').strip() else None
                 elif event in ('task_started', 'turn_aborted'):
                     completed = None
+                    asked = asked or event == 'task_started'
             if (completed and completed[0] and kind == 'response_item' and payload.get('type') == 'message'
                     and payload.get('role') == 'assistant' and payload.get('phase') == 'final_answer'
                     and text_block(payload.get('content'), 'output_text')):
-                return completed
+                return (*completed, None if asked else excerpt(block_text(payload['content'], 'output_text')))
     return None
 
 

@@ -63,11 +63,13 @@ class PiAgentTest(unittest.TestCase):
             final = message('4', '3', 'assistant', '这是正式回复', 'stop')
             second = snapshot(user, tool_use, tool_result, final)
             self.assertTrue(second['reply']['id'])
+            self.assertEqual(second['reply']['excerpt'], '这是正式回复')
             new_user = message('5', '4', 'user', '下一条请求')
             aborted = message('6', '5', 'assistant', '没说完', 'aborted')
             third = snapshot(user, tool_use, tool_result, final, new_user, aborted)
             self.assertEqual(third['preview'], '下一条请求')
-            self.assertEqual(third['reply'], second['reply'])
+            # The user asked again: the same reply, without the excerpt the session list showed.
+            self.assertEqual(third['reply'], {k: v for k, v in second['reply'].items() if k != 'excerpt'})
             # The page marks these messages as the user's bubbles.
             with patch.object(server, 'tmux', return_value=f'\t{path}\t下一条请求\n'):
                 self.assertEqual(server.pi_user_messages('test'), (('下一条请求', '看一下\n 当前任务'), '下一条请求'))

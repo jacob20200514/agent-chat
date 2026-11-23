@@ -169,6 +169,41 @@ class WorkingState(unittest.TestCase):
         native_status.assert_not_called()
         self.assertEqual(exited['state'], 'exited')
 
+    def test_session_card_shows_the_answer_until_the_next_message(self):
+        screen = '❯ 修好了吗\n\n⏺ 修好了，已经上线\n\n' + composer('claude')
+        native = {}
+
+        with (
+            tempfile.TemporaryDirectory() as data,
+            patch.object(server, 'DATA', Path(data)),
+            patch.object(server, 'list_sessions', side_effect=lambda only=None: [
+                dict(name='c', agent='claude', state='unknown', _agent_process=(1, 2))]),
+            patch.object(server, 'capture', return_value=screen),
+            patch.object(server.reply_status, 'native_status', side_effect=lambda *args: native['value']),
+            ThreadingHTTPServer(('127.0.0.1', 0), server.Handler) as httpd,
+        ):
+            cookie = server.COOKIE + '=' + server.new_login(False)
+            worker = threading.Thread(target=httpd.serve_forever)
+            worker.start()
+
+            def preview():
+                req = Request(f'http://127.0.0.1:{httpd.server_port}/api/sessions', headers={'Cookie': cookie})
+                with build_opener(ProxyHandler({})).open(req, timeout=5) as response:
+                    return json.load(response)['sessions'][0]['preview']
+
+            try:
+                for reply, working, expected in (
+                        (('r', None, '修好了，已经上线'), False, '修好了，已经上线'),
+                        (('r', None, '修好了，已经上线'), True, '修好了吗'),  # a turn the user did not start
+                        (('r', None, None), False, '修好了吗'),  # asked again; that turn failed or was stopped
+                ):
+                    with self.subTest(reply=reply, working=working):
+                        native['value'] = (server.reply_status.reply_status('claude:s', reply), working)
+                        self.assertEqual(preview(), expected)
+            finally:
+                httpd.shutdown()
+                worker.join()
+
     def test_home_and_chat_report_busy_then_idle(self):
         captures = {'claude': CLAUDE_RUNNING, 'codebuddy': CODEBUDDY_RUNNING}
 
