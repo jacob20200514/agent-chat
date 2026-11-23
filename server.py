@@ -55,14 +55,16 @@ SHELL_ONLY = 'shell'  # "new session" choice that starts no agent
 # selected, so the first chat message's Enter ran a self-update and Codex exited, closing the tmux
 # session (2026-11-14, when 0.169.0 came out). Updating stays a deliberate step in a terminal.
 AGENTS = {
-    'claude': {'label': 'Claude', 'command': 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode bypassPermissions', 'new': '/clear', 'width': 46},
-    'codex': {'label': 'Codex', 'command': 'codex -c check_for_update_on_startup=false --no-alt-screen --sandbox danger-full-access --ask-for-approval never', 'new': '/new', 'width': 46},
-    'codebuddy': {'label': 'CodeBuddy', 'command': 'codebuddy -y', 'new': '/clear', 'width': 46},
-    # Pi truncates its footer from the right after adding token and usage counters: at 46 columns the model
-    # and thinking level fall off it.
-    'pi': {'label': 'Pi', 'command': 'pi --tui-mode regular', 'new': '/new', 'width': 100},
+    'claude': {'label': 'Claude', 'command': 'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode bypassPermissions', 'new': '/clear'},
+    'codex': {'label': 'Codex', 'command': 'codex -c check_for_update_on_startup=false --no-alt-screen --sandbox danger-full-access --ask-for-approval never', 'new': '/new'},
+    'codebuddy': {'label': 'CodeBuddy', 'command': 'codebuddy -y', 'new': '/clear'},
+    'pi': {'label': 'Pi', 'command': 'pi --tui-mode regular', 'new': '/new'},
 }
-WIDE_MAX = 120  # the page's wide mode fits the pane to the window, up to this many columns
+# Every agent starts this wide. A desktop window shows the CLI's lines whole and a phone wraps each long line
+# (2026-11-23; this replaced a wide/narrow toggle, because each resize left Claude's latest output twice in the
+# scrollback). Pi needs about this much: it cuts its footer from the right once usage counters are added, and at
+# 46 columns the model and thinking level fell off it.
+PANE_WIDTH = 100
 for _agent, _override in json.loads((DATA / 'agents.json').read_text()).items() if (DATA / 'agents.json').exists() else ():
     AGENTS[_agent]['command'] = _override['command']
 SHELLS = {'zsh', 'bash', 'sh', 'fish', 'login', '-zsh', '-bash'}
@@ -182,15 +184,15 @@ def session_lock(name):
 def list_sessions(only=None):
     """All tmux sessions, or with only= just that one: the chat page polls every second and needs no ps
     run for the other panes."""
-    out = tmux('list-panes', '-a', '-F', '#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_current_command}\t#{pane_tty}\t#{window_active}\t#{pane_active}\t#{pane_dead}\t#{history_size}\t#{history_limit}\t#{window_width}', check=False)
+    out = tmux('list-panes', '-a', '-F', '#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_current_command}\t#{pane_tty}\t#{window_active}\t#{pane_active}\t#{pane_dead}\t#{history_size}\t#{history_limit}', check=False)
     rows = {}
     for line in out.splitlines():
-        name, created, attached, command, tty, window_active, pane_active, dead, history_size, history_limit, width = line.split('\t')
+        name, created, attached, command, tty, window_active, pane_active, dead, history_size, history_limit = line.split('\t')
         if only is not None and name != only:
             continue
         if name in rows and not (window_active == '1' and pane_active == '1'):
             continue
-        rows[name] = {'name': name, 'created': int(created), 'attached': int(attached), 'command': command, 'tty': tty, 'dead': dead == '1', 'width': int(width),
+        rows[name] = {'name': name, 'created': int(created), 'attached': int(attached), 'command': command, 'tty': tty, 'dead': dead == '1',
                       'history_complete': int(history_size) <= HISTORY_LINES and int(history_size) < int(history_limit)}
     meta = load('sessions.json', {})
     result = []
@@ -202,7 +204,6 @@ def list_sessions(only=None):
                        'agent_label': AGENTS[agent]['label'] if agent and not shell else ('Shell' if shell else '未知'),
                        'created': row['created'], 'attached': row['attached'], 'model': saved.get('model'), 'effort': saved.get('effort'),
                        'state': 'exited' if shell else 'unknown', 'dead': row['dead'], 'history_complete': row['history_complete'],
-                       'width': row['width'], 'default_width': AGENTS[agent]['width'] if agent and not shell else None,
                        '_agent_process': row.get('_agent_process')})
     return sorted(result, key=lambda r: -r['created'])
 
@@ -1059,11 +1060,10 @@ def create_session(agent, nickname):
     launch_args = ['-c', str(Path.home())]
     prefix = 'zsh' if agent == SHELL_ONLY else agent
     if agent != SHELL_ONLY:
-        width = str(AGENTS[agent]['width'])
         command = AGENTS[agent]['command']
         if agent == 'pi':
             command += ' --extension ' + shlex.quote(str(ROOT / 'pi-session-status.ts'))
-        launch_args = ['-x', width, '-y', '50', *launch_args, 'zsh', '-ic', command]
+        launch_args = ['-x', str(PANE_WIDTH), '-y', '50', *launch_args, 'zsh', '-ic', command]
 
     # tmux checks the name at creation, including races with other requests or terminals.
     for _ in range(10):
@@ -1087,22 +1087,6 @@ def create_session(agent, nickname):
     if agent != 'pi':
         threading.Thread(target=accept_trust_prompt, args=(name,), daemon=True).start()
     return name
-
-
-def set_width(session, columns):
-    """The CLIs break their own lines at the pane width, so wider text on the page needs a wider pane.
-    Codex, CodeBuddy and Pi clear their scrollback and reprint the conversation at the new width. Claude
-    redraws only what it can still reach: its older output keeps the old width, and each switch leaves a
-    second copy of the latest output, from a few lines to the whole last turn. Clearing the history would
-    drop everything above the screen; a temporarily taller window still left copies (2026-11-22)."""
-    if type(columns) is not int:
-        raise ValueError('columns')
-    columns = max(AGENTS[session['agent']]['width'], min(WIDE_MAX, columns))
-    # resize-window pins the window size. Unsetting it right away keeps the size while no terminal is
-    # attached, and Termius still resizes the window to its own screen when it attaches.
-    tmux('resize-window', '-t', target(session['name']), '-x', str(columns), ';',
-         'set-option', '-uw', '-t', target(session['name']), 'window-size')
-    return columns
 
 
 def accept_trust_prompt(name):
@@ -1297,7 +1281,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {}, headers=[('Set-Cookie', COOKIE + '=; Max-Age=0' + self.cookie_flags())])
             if path == '/api/sessions':
                 return self.reply(200, {'name': create_session(body.get('agent'), body.get('nickname'))})
-            match = re.fullmatch(r'/api/sessions/([^/]+)/(send|key|model|effort|new|kill|rename|width)', path)
+            match = re.fullmatch(r'/api/sessions/([^/]+)/(send|key|model|effort|new|kill|rename)', path)
             if not match:
                 return self.reply(404, {'error': 'not found'})
             session, action = find_session(match.group(1)), match.group(2)
@@ -1351,10 +1335,6 @@ class Handler(BaseHTTPRequestHandler):
                     with state_lock:
                         sent.append(message_id); del sent[:-200]
                     send_text(name, text)
-                elif action == 'width':
-                    if session['attached']:
-                        return self.reply(409, {'error': '终端正连着这个会话，宽度跟随终端；断开终端后再切换'})
-                    return self.reply(200, {'width': set_width(session, body.get('columns'))})
                 elif action == 'new':
                     agent = session['agent']
                     slash(name, AGENTS[agent]['new'], agent=agent)

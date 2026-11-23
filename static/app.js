@@ -142,10 +142,6 @@ function renderHeader() {
   $('chat-dot').className = 'dot ' + s.state;
   const usable = !!s.agent && s.state !== 'exited';
   for (const id of ['model', 'effort', 'new']) $(id).disabled = !usable;
-  // The button names what a click does: widen a phone-width pane, or bring a wide one back.
-  const wide = s.width > s.default_width;
-  $('width').disabled = !usable; $('width').textContent = wide ? '窄屏' : '宽屏';
-  $('width').title = wide ? '回到手机宽度' : '按窗口宽度显示';
   $('usage').hidden = !state.usageSupported || !usable || !['codex', 'claude', 'pi'].includes(s.agent);
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
   $('send').disabled = s.dead;
@@ -301,23 +297,6 @@ $('chat').addEventListener('touchend', (event) => {
   if (dx > 80 && dy < dx / 2 && quick && getSelection().isCollapsed) $('back').click();
 }, { passive: true });
 $('keys-toggle').addEventListener('click', () => $('keys').classList.toggle('on'));
-// The CLIs break their own lines at the pane width, so wide text means a wider tmux pane: as many
-// monospace columns as fit in an agent block on this screen at the current text size (server caps it).
-function fitColumns() {
-  const probe = document.createElement('div');
-  probe.className = 'block agent'; probe.style.visibility = 'hidden'; probe.innerHTML = '<pre><span>0000000000</span></pre>';
-  $('log').append(probe);
-  const pre = probe.firstChild, columns = Math.floor(pre.clientWidth / (pre.firstChild.getBoundingClientRect().width / 10));
-  probe.remove();
-  return columns;
-}
-$('width').addEventListener('click', async () => {
-  const s = state.current, visit = state.visit, wide = s.width > s.default_width;
-  const columns = wide ? s.default_width : fitColumns();
-  if (!wide && columns <= s.default_width) { setStatus('窗口不够宽，无法再加宽', true); return; }
-  state.stick = true;
-  if (await act('width', { columns }, wide ? '正在切回手机宽度…' : '正在加宽…', visit)) { state.current.width = columns; renderHeader(); }
-});
 $('keys').addEventListener('click', (event) => { const key = event.target.dataset.key; if (key) act('key', { key }, ' '); });
 $('back').addEventListener('click', () => show('home'));
 

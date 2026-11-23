@@ -51,6 +51,7 @@ header small { display:block; font-size:12px; color:var(--muted); font-weight:40
 .bar button { flex:1; white-space:nowrap; padding:6px 8px; min-height:36px; font-size:14px; }
 #log { flex:1; overflow:auto; overscroll-behavior:contain; padding:12px; -webkit-overflow-scrolling:touch; }
 .block { margin:0 0 10px; position:relative; }
+/* Panes are 100 columns (server.py PANE_WIDTH): a phone wraps each long line instead of scrolling sideways. */
 .block pre { margin:0; white-space:pre-wrap; word-break:break-word; font:var(--log-size, 12.5px)/1.45 ui-monospace, "SF Mono", Menlo, monospace; }
 .block.user { margin-left:18%; background:var(--user); border-radius:14px 14px 4px 14px; padding:8px 12px; }
 .block.agent { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:10px 12px 30px; }
@@ -110,7 +111,7 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
 <p id="empty" class="muted">从左侧选择一个会话，或点「新建」。</p>
 
 <section id="chat" class="view">
-  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button id="font-down" aria-label="字体变小">−</button><button id="font-up" aria-label="字体变大">+</button><button id="width" type="button" title="按窗口宽度显示">宽屏</button><button id="rename">改名</button></header>
+  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button id="font-down" aria-label="字体变小">−</button><button id="font-up" aria-label="字体变大">+</button><button id="rename">改名</button></header>
   <div class="bar"><button id="model">Model</button><button id="effort">Effort</button><button id="new">New</button><button id="usage" type="button" hidden>额度</button><button id="keys-toggle">按键</button><button id="kill" class="danger">关闭 tmux</button></div>
   <div id="log"></div>
   <div id="status"></div>

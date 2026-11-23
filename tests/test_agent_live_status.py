@@ -157,7 +157,7 @@ Claude Code v2.1.322
 
     def test_history_completeness_accounts_for_capture_and_tmux_limits(self):
         for size, limit, expected in [(100, 50000, True), (6745, 50000, False), (2000, 2000, False)]:
-            row = f'qa\t1\t0\tclaude.exe\t/dev/ttys099\t1\t1\t0\t{size}\t{limit}\t46\n'
+            row = f'qa\t1\t0\tclaude.exe\t/dev/ttys099\t1\t1\t0\t{size}\t{limit}\n'
             with (self.subTest(size=size, limit=limit),
                   patch.object(self.server, 'tmux', return_value=row),
                   patch.object(self.server, 'detect_agent', return_value='claude'),

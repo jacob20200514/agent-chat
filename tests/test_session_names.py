@@ -19,6 +19,14 @@ class SessionNames(unittest.TestCase):
                 self.assertEqual(tmux.call_args.args[:4], ('new-session', '-d', '-s', name))
                 self.assertEqual(remember.call_args.kwargs['nickname'], name)
 
+    def test_every_agent_starts_100_columns_wide(self):
+        for agent in server.AGENTS:
+            with self.subTest(agent=agent), patch.object(server, 'tmux') as tmux, \
+                    patch.object(server, 'remember'), patch.object(server.threading, 'Thread'):
+                server.create_session(agent, '')
+                args = tmux.call_args.args
+                self.assertEqual(args[args.index('-x') + 1], '100')
+
     def test_generated_name_retries_a_tmux_collision(self):
         with patch.object(server.secrets, 'choice', side_effect='abcdef'), \
                 patch.object(server, 'tmux', side_effect=[RuntimeError('duplicate session: zsh-abc'), '']) as tmux, \
