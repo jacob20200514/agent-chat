@@ -286,7 +286,8 @@ def drop_composer(text, agent=None):
     """The agent CLIs keep their input box and hint footer at the bottom of the pane; it is not chat.
     The last prompt-marked line is that input box, so it and the few footer lines under it are cut."""
     if agent == 'pi':
-        # Pi's editor has no prompt marker. A bare > belongs to its native menu's search field.
+        # Pi's editor has no prompt marker (a bare > belongs to its native menu's search field); its rules are
+        # gone after clean(), so drop_pi_editor() cuts it from the raw capture.
         return text
     lines = text.split('\n')
     for i in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
@@ -297,7 +298,8 @@ def drop_composer(text, agent=None):
     return text
 
 
-USER_LINE = re.compile(r'^(\s*[❯›]|>)\s+(\S.*)')
+# At the margin: the agents indent their tool output, which may hold a prompt mark of its own.
+USER_LINE = re.compile(r'^([❯›>])\s+(\S.*)')
 # Continuation of a message: two spaces plus any indent of the user's own. Replies that are indented too start
 # with a tree glyph or a dot; Codex shows the user's "- " as "•".
 USER_MORE = re.compile(r'^ {2}(\s*[^\s└⎿├│⏺●].*)')
@@ -316,6 +318,41 @@ def menu_row(lines, i):
         if REPLY_OR_PROMPT.match(line):
             return False
     return False
+
+
+def keep_message_gaps(raw, agent):
+    """Runs on the raw capture, before clean() turns every blank line into one kind.
+    Codex and CodeBuddy show a blank line inside the user's message as an empty line, like the gap after the
+    message; the message goes on below it with two-space-indented text, while a reply starts at the margin or
+    with a tree glyph. Such a line becomes PADDED_BLANK, what Claude's padded blank lines become, so the page
+    keeps the message in one bubble. Codex leaves the input box it drew before its startup redraw in the
+    scrollback, with a line of one space under it, never an empty one: that box and its footer are dropped.
+    The last input box is the live one; drop_composer() cuts it and the model is read from its footer."""
+    lines = raw.split('\n')
+    last_prompt = max((i for i, line in enumerate(lines) if PROMPT_LINE.match(line)), default=-1)
+    out = []
+    in_user = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        after = lines[i + 1] if i + 1 < len(lines) else None
+        if agent == 'codex' and i < last_prompt and after == ' ' and USER_LINE.match(line):
+            i += 2
+            while i < len(lines) and lines[i].strip():
+                i += 1
+            in_user = False
+            continue
+        if USER_LINE.match(line):
+            in_user = True
+        elif in_user and line == '' and after is not None and USER_MORE.match(after):
+            line = PADDED_BLANK
+        elif not (in_user and (USER_MORE.match(line) or (len(line) >= 2 and not line.strip()))):
+            in_user = False
+        out.append(line)
+        i += 1
+    return '\n'.join(out)
+
+
 NEW_CONVERSATION = {agent['new'] for agent in AGENTS.values()}
 
 
@@ -420,8 +457,8 @@ def pi_transcript(path, modified_ns, size):
             if entry.get('id'):
                 leaf = entry['id']
                 entries[leaf] = entry
-    preview, reply, selection = None, None, None
-    while leaf and (preview is None or reply is None or selection is None):
+    preview, reply, selection, asked = None, None, None, []
+    while leaf:
         entry = entries.get(leaf, {})
         leaf = entry.get('parentId')
         if selection is None and entry.get('type') == 'model_change':
@@ -429,22 +466,96 @@ def pi_transcript(path, modified_ns, size):
         if entry.get('type') != 'message':
             continue
         msg = entry['message']
-        if preview is None and msg['role'] == 'user':
-            text = ' '.join(pi_message_text(msg).split())
-            if text and not text.startswith('/'):
+        if msg['role'] == 'user':
+            asked.append(pi_message_text(msg))
+            text = ' '.join(asked[-1].split())
+            if preview is None and text and not text.startswith('/'):
                 preview = text[:120]
         elif reply is None and msg['role'] == 'assistant' and msg.get('stopReason') == 'stop' and pi_message_text(msg).strip():
             reply = (entry['id'], entry.get('timestamp'))
-    return preview or '', reply, selection, header.get('id')
+    return preview or '', reply, selection, header.get('id'), tuple(asked)
 
 
-def update_pi_turn(session):
-    # Only use metadata explicitly published by this pane, not another Pi session in the same directory.
-    settings = tmux('display-message', '-p', '-t', target(session['name']),
+def pi_pane_settings(name):
+    """What the pane's own Pi published through pi-session-status.ts: provider, transcript path, latest request."""
+    settings = tmux('display-message', '-p', '-t', target(name),
                     '#{@agent-chat-pi-provider}\t#{@agent-chat-pi-session}\t#{@agent-chat-pi-request}',
                     check=False).removesuffix('\n')
     provider, _, rest = settings.partition('\t')
     filename, _, request = rest.partition('\t')
+    return provider, filename, request
+
+
+def pi_user_messages(name):
+    """The user's messages in the pane's transcript, and the request it is sending now: on the first turn the
+    transcript may not exist until the assistant answers."""
+    _, filename, request = pi_pane_settings(name)
+    path = Path(filename)
+    if path.is_absolute() and path.suffix == '.jsonl':
+        try:
+            info = path.stat()
+            return pi_transcript(path, info.st_mtime_ns, info.st_size)[4], request
+        except (OSError, ValueError, StopIteration):
+            pass  # not written yet, or being rewritten; the request still marks the newest message
+    return (), request
+
+
+def message_key(text):
+    """Pi renders the user's Markdown (bold, code spans, links) and wraps it to the pane: compare the letters
+    and digits. A message of punctuation only ("？") is compared without its whitespace."""
+    return re.sub(r'[\W_]+', '', text) or re.sub(r'\s+', '', text)
+
+
+def mark_pi_messages(raw, messages, request=''):
+    """Pi draws the user's message as a panel: a line of spaces above and below the text, between empty lines,
+    and the text indented one column. Tool cards are drawn the same way, so a panel is the user's only when its
+    text is one of the user's messages. It is rewritten the way Codex shows a message ("› ", then lines indented
+    two spaces) so the page needs no Pi rule. Runs on the raw capture: clean() merges the panel's edges into
+    the empty lines around it, and then an answer that repeats the message would look the same."""
+    keys = {message_key(text) for text in messages if text.strip()}
+    flat = ' '.join(request.split())
+    newest = message_key(flat) if flat else ''
+
+    def padding(line):
+        return len(line) >= 2 and not line.strip()
+
+    lines = raw.split('\n')
+    out = []
+    i = 0
+    while i < len(lines):
+        if lines[i] == '' and i + 1 < len(lines) and padding(lines[i + 1]):
+            end = next((k for k in range(i + 2, len(lines) - 1) if padding(lines[k]) and lines[k + 1] == ''), None)
+            body = lines[i + 2:end] if end else []
+            if body and body[0].strip() and all(line.startswith(' ') for line in body):
+                key = message_key('\n'.join(body))
+                # The extension publishes at most 120 characters of the request.
+                if key in keys or (newest and (key == newest or (len(flat) >= 120 and key.startswith(newest)))):
+                    out += ['', '› ' + body[0][1:]] + [('  ' + line[1:]) if line.strip() else line for line in body[1:]]
+                    i = end + 1
+                    continue
+        out.append(lines[i])
+        i += 1
+    return '\n'.join(out)
+
+
+def drop_pi_editor(raw):
+    """Pi's editor sits between two rules at the bottom of the pane, the working spinner on the upper rule and the
+    directory and usage footer under the lower one; like the other agents' input boxes it is not chat. Only an
+    empty editor is cut: a draft, or a selector (/model, /resume) drawn in its place, stays on the page."""
+    lines = raw.split('\n')
+    bottom = next((i for i in range(len(lines) - 1, max(-1, len(lines) - 12), -1)
+                   if re.fullmatch(r'─{8,}', lines[i].strip())), None)
+    if bottom is None:
+        return raw
+    top = next((i for i in range(bottom - 1, max(-1, bottom - 4), -1) if lines[i].startswith('──')), None)
+    if top is None or any(line.strip() for line in lines[top + 1:bottom]):
+        return raw
+    return '\n'.join(lines[:top])
+
+
+def update_pi_turn(session):
+    # Only use metadata explicitly published by this pane, not another Pi session in the same directory.
+    provider, filename, request = pi_pane_settings(session['name'])
     if provider:
         session['model_provider'] = provider if re.fullmatch(r'[\w.-]+', provider) and provider != '-' else None
     session['preview'] = request
@@ -453,7 +564,7 @@ def update_pi_turn(session):
         return
     try:
         info = path.stat()
-        preview, reply, selection, session_id = pi_transcript(path, info.st_mtime_ns, info.st_size)
+        preview, reply, selection, session_id, _ = pi_transcript(path, info.st_mtime_ns, info.st_size)
         session['preview'] = preview or request
         if session_id:
             session['reply'] = reply_status.reply_status(f'pi:{path}', reply)
@@ -470,7 +581,7 @@ def update_pi_turn(session):
 
 def session_snapshot(session, raw):
     process = session.pop('_agent_process', None)
-    text = clean(raw)
+    text = clean(keep_message_gaps(raw, session['agent']) if session['agent'] not in (None, 'pi') else raw)
     working = None
     if session['agent'] and session['agent'] != 'pi' and session['state'] != 'exited':
         # The CLI's own records decide when it exposes them; the screen is the fallback.
@@ -1136,7 +1247,12 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r'/api/sessions/([^/]+)/output', path)
             if match:
                 session = find_session(match.group(1))
-                cleaned = session_snapshot(session, capture(session['name']))
+                raw = capture(session['name'])
+                cleaned = session_snapshot(session, raw)
+                if session.get('agent') == 'pi':
+                    # Only the page's copy: the menu check above must not read "› 1." in a message as a menu.
+                    marked = mark_pi_messages(raw, *pi_user_messages(session['name']))
+                    cleaned = clean(drop_pi_editor(marked) if session['state'] != 'exited' else marked)
                 if session.get('agent') and session['state'] != 'exited':
                     cleaned = drop_composer(cleaned, session['agent'])
                 # The phone polls every second; when the screen is unchanged only the small session header is sent.

@@ -68,10 +68,14 @@ class PiAgentTest(unittest.TestCase):
             third = snapshot(user, tool_use, tool_result, final, new_user, aborted)
             self.assertEqual(third['preview'], '下一条请求')
             self.assertEqual(third['reply'], second['reply'])
+            # The page marks these messages as the user's bubbles.
+            with patch.object(server, 'tmux', return_value=f'\t{path}\t下一条请求\n'):
+                self.assertEqual(server.pi_user_messages('test'), (('下一条请求', '看一下\n 当前任务'), '下一条请求'))
             path.unlink()
             with patch.object(server, 'tmux', return_value=f'\t{path}\t刚开始的任务\n'):
                 session = {'name': 'test'}
                 server.update_pi_turn(session)
+                self.assertEqual(server.pi_user_messages('test'), ((), '刚开始的任务'))
             self.assertEqual((session['preview'], session['reply']['id']), ('刚开始的任务', None))
 
     def test_recognizes_pi_process_without_saved_session_metadata(self):

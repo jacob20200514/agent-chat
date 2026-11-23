@@ -152,7 +152,8 @@ function renderHeader() {
   $('input').placeholder = s.choice ? '在这里回复选项（如数字）后发送…' : usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
 }
 // The pane is one stream of text. Lines the CLI marks as the user's prompt become right-hand bubbles and
-// split it into blocks, so each stretch of agent output can be copied on its own.
+// split it into blocks, so each stretch of agent output can be copied on its own. The mark is at the margin:
+// tool output the agents show indented may hold a "›" of its own. server.py turns Pi's panels into this form.
 // A menu's cursor row ("❯ 1. Yes") carries the prompt mark too and belongs to the agent's question: its key hint
 // ("Enter to select", "Esc to cancel", "esc back") follows. A message of the user's that starts with "1." is
 // followed by the reply or the next prompt instead. Same rule as menu_row() in server.py.
@@ -174,10 +175,10 @@ function blocks(text) {
   const lines = text.split('\n');
   let inUser = false;
   lines.forEach((line, i) => {
-    const user = (/^\s*[❯›]\s+\S/.test(line) || /^>\s+\S/.test(line)) && !menuRow(lines, i);
+    const user = /^[❯›>]\s+\S/.test(line) && !menuRow(lines, i);
     if (inUser && !user && moreOfMessage(line)) { current.lines.push(line.slice(2)); return; }
-    // A blank line inside the message arrives as two spaces (server.py PADDED_BLANK); a truly empty line ends it.
-    // Codex leaves blank lines inside a message truly empty, like the gap under its input box, so they end it too.
+    // A blank line inside the message arrives as two spaces (server.py PADDED_BLANK; keep_message_gaps() turns
+    // Codex's and CodeBuddy's empty ones into it); a truly empty line ends it.
     if (inUser && line === '  ') { current.lines.push(''); return; }
     inUser = user;
     if (user) { current = null; push('user', line.replace(/^\s*[❯›>]\s+/, '')); } else push('agent', line === '  ' ? '' : line);
