@@ -45,7 +45,7 @@ class ReplyStatusTest(unittest.TestCase):
         final = assistant('4', 'end_turn', text())
         side = assistant('5', 'end_turn', text(), isSidechain=True)
         self.assertIsNone(self.snapshot('claude', progress, thinking, abort, side, incomplete=final))
-        self.assertEqual(self.snapshot('claude', progress, thinking, final, abort, side), ('4', STAMP, 'reply body'))
+        self.assertEqual(self.snapshot('claude', progress, thinking, final, abort, side), ('4', STAMP, 'reply body', None))
         self.assertEqual(reply_status.reply_status('c', ('4', STAMP))['at'], STAMP_MS)
 
     def test_codebuddy_waits_for_turn_metrics_after_assistant_output(self):
@@ -58,7 +58,7 @@ class ReplyStatusTest(unittest.TestCase):
         finished = dict(type='turn-metrics', timestamp=STAMP_MS)
         self.assertIsNone(self.snapshot('codebuddy', progress, tool, result, final))
         self.assertIsNone(self.snapshot('codebuddy', progress, tool, result, finished))
-        self.assertEqual(self.snapshot('codebuddy', progress, tool, result, final, finished, progress, tool), ('final', STAMP_MS, 'reply body'))
+        self.assertEqual(self.snapshot('codebuddy', progress, tool, result, final, finished, progress, tool), ('final', STAMP_MS, 'reply body', None))
         self.assertEqual(reply_status.reply_status('b', ('final', STAMP_MS))['at'], STAMP_MS)
 
     def test_codex_requires_final_answer_and_successful_turn_completion(self):
@@ -72,14 +72,15 @@ class ReplyStatusTest(unittest.TestCase):
         commentary, final = assistant('commentary'), assistant('final_answer')
         large_tool_result = dict(type='response_item', payload={'type': 'function_call_output', 'output': 'x' * 130000})
         finished = event('task_complete', turn_id='turn-1', last_agent_message='reply body')
-        self.assertIsNone(self.snapshot('codex', started, commentary, large_tool_result, finished))
-        self.assertIsNone(self.snapshot('codex', started, final, aborted))
-        self.assertIsNone(self.snapshot('codex', started, final, incomplete=finished))
+        unanswered = (None, None, None, STAMP)  # only when the user asked
+        self.assertEqual(self.snapshot('codex', started, commentary, large_tool_result, finished), unanswered)
+        self.assertEqual(self.snapshot('codex', started, final, aborted), unanswered)
+        self.assertEqual(self.snapshot('codex', started, final, incomplete=finished), unanswered)
         self.assertEqual(self.snapshot('codex', started, commentary, large_tool_result, final, finished),
-                         ('turn-1', STAMP, 'reply body'))
+                         ('turn-1', STAMP, 'reply body', STAMP))
         # A later turn means the user asked again: the reply stays read or unread, but its excerpt is gone.
         self.assertEqual(self.snapshot('codex', started, commentary, large_tool_result, final, finished,
-                                       started, commentary, aborted), ('turn-1', STAMP, None))
+                                       started, commentary, aborted), ('turn-1', STAMP, None, STAMP))
 
     def test_excerpt_lasts_until_the_user_sends_the_next_message(self):
         markdown = '## 结论\n**已修好**，`869c97c` 已推送\n- [打开页面](https://example.com/a)看第二点'
@@ -92,7 +93,7 @@ class ReplyStatusTest(unittest.TestCase):
         command = claude_user('<command-name>/model</command-name>')
         notice = claude_user('<task-notification>', origin={'kind': 'task-notification'})
         self.assertEqual(self.snapshot('claude', final, tool_result, command, notice)[2], '结论 已修好，869c97c 已推送 打开页面看第二点')
-        self.assertEqual(self.snapshot('claude', final, human, tool_result), ('4', STAMP, None))
+        self.assertEqual(self.snapshot('claude', final, human, tool_result), ('4', STAMP, None, None))
 
         answer = dict(type='message', role='assistant', status='completed', id='final', content=text('output_text'))
         finished = dict(type='turn-metrics', timestamp=STAMP_MS)
@@ -101,7 +102,41 @@ class ReplyStatusTest(unittest.TestCase):
         for meta, expected in (({'agent': 'cli'}, None), ({'skipRun': True}, 'reply body'),
                                ({'agent': 'cli', 'isMeta': True}, 'reply body')):
             with self.subTest(meta=meta):
-                self.assertEqual(self.snapshot('codebuddy', answer, finished, codebuddy_user(**meta)), ('final', STAMP_MS, expected))
+                self.assertEqual(self.snapshot('codebuddy', answer, finished, codebuddy_user(**meta))[:3], ('final', STAMP_MS, expected))
+
+    def test_asked_is_when_the_users_latest_message_was_recorded(self):
+        # The session list shows the message's time: the newest one the user sent, also when the reply answering it
+        # came after it, and only messages the CLI marks as the user's.
+        first, later = '2026-11-21T09:00:00Z', '2026-11-21T09:05:00Z'
+        claude_final = dict(type='assistant', uuid='4', timestamp='2026-11-21T09:03:00Z',
+                            message=dict(role='assistant', stop_reason='end_turn', content=text()))
+        def claude_user(stamp, **fields):
+            return dict(type='user', timestamp=stamp, message=dict(role='user', content='问'), **fields)
+        human, again = claude_user(first, origin={'kind': 'human'}), claude_user(later, origin={'kind': 'human'})
+        notice = claude_user(later, origin={'kind': 'task-notification'})
+        self.assertEqual(self.snapshot('claude', human), (None, None, None, first))
+        self.assertEqual(self.snapshot('claude', human, claude_final, notice)[3], first)
+        self.assertEqual(self.snapshot('claude', human, claude_final, again)[2:], (None, later))
+
+        answer = dict(type='message', role='assistant', status='completed', id='final', content=text('output_text'))
+        finished = dict(type='turn-metrics', timestamp=STAMP_MS + 60000)
+        def codebuddy_user(stamp, **meta):
+            return dict(type='message', role='user', timestamp=stamp, content=[], providerData=meta)
+        asked, scheduled = codebuddy_user(STAMP_MS, agent='cli'), codebuddy_user(STAMP_MS + 120000, isMeta=True)
+        self.assertEqual(self.snapshot('codebuddy', asked, answer, finished, scheduled)[3], STAMP_MS)
+        self.assertEqual(self.snapshot('codebuddy', asked, answer, finished, codebuddy_user(STAMP_MS + 180000))[3], STAMP_MS + 180000)
+
+        def event(kind, stamp, **fields):
+            return dict(type='event_msg', timestamp=stamp, payload=dict(type=kind, **fields))
+        codex_final = dict(type='response_item', payload=dict(type='message', role='assistant', phase='final_answer',
+                                                              content=text('output_text')))
+        turn = (event('task_started', first), codex_final,
+                event('task_complete', '2026-11-21T09:03:00Z', turn_id='a', last_agent_message='reply body'))
+        self.assertEqual(self.snapshot('codex', *turn)[3], first)
+        self.assertEqual(self.snapshot('codex', *turn, event('task_started', later))[3], later)
+
+        self.assertEqual(reply_status.reply_status('c', ('4', STAMP, None, STAMP))['asked_at'], STAMP_MS)
+        self.assertNotIn('asked_at', reply_status.reply_status('c', ('4', STAMP, None, None)))
 
     def test_codex_process_binding_ignores_other_panes_old_processes_and_subagents(self):
         root = self.home / '.codex'

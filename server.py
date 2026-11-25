@@ -448,7 +448,7 @@ def pi_transcript(path, modified_ns, size):
     with path.open(encoding='utf-8') as log:
         header = json.loads(next(log))
         if header.get('type') != 'session':
-            return '', None, None, None
+            return '', None, None, None, (), None
         entries = {}
         leaf = None
         for line in log:
@@ -458,7 +458,7 @@ def pi_transcript(path, modified_ns, size):
             if entry.get('id'):
                 leaf = entry['id']
                 entries[leaf] = entry
-    preview, reply, selection, asked = None, None, None, []
+    preview, preview_at, reply, selection, asked = None, None, None, None, []
     while leaf:
         entry = entries.get(leaf, {})
         leaf = entry.get('parentId')
@@ -471,11 +471,11 @@ def pi_transcript(path, modified_ns, size):
             asked.append(pi_message_text(msg))
             text = ' '.join(asked[-1].split())
             if preview is None and text and not text.startswith('/'):
-                preview = text[:120]
+                preview, preview_at = text[:120], reply_status.millis(entry.get('timestamp'))
         elif reply is None and msg['role'] == 'assistant' and msg.get('stopReason') == 'stop' and pi_message_text(msg).strip():
             # The excerpt is kept only while no message of the user's follows the reply.
             reply = (entry['id'], entry.get('timestamp'), None if asked else reply_status.excerpt(pi_message_text(msg)))
-    return preview or '', reply, selection, header.get('id'), tuple(asked)
+    return preview or '', reply, selection, header.get('id'), tuple(asked), preview_at
 
 
 def pi_pane_settings(name):
@@ -560,14 +560,15 @@ def update_pi_turn(session):
     provider, filename, request = pi_pane_settings(session['name'])
     if provider:
         session['model_provider'] = provider if re.fullmatch(r'[\w.-]+', provider) and provider != '-' else None
-    session['preview'] = request
+    session['preview'], session['preview_at'] = request, None  # the extension does not publish when it was sent
     path = Path(filename)
     if not path.is_absolute() or path.suffix != '.jsonl':
         return
     try:
         info = path.stat()
-        preview, reply, selection, session_id, _ = pi_transcript(path, info.st_mtime_ns, info.st_size)
-        session['preview'] = preview or request
+        preview, reply, selection, session_id, _, preview_at = pi_transcript(path, info.st_mtime_ns, info.st_size)
+        if preview:
+            session['preview'], session['preview_at'] = preview, preview_at
         if session_id:
             session['reply'] = reply_status.reply_status(f'pi:{path}', reply)
         # Older instances of the extension only publish the transcript path. The footer may omit
@@ -1212,13 +1213,14 @@ class Handler(BaseHTTPRequestHandler):
                         row.pop('_agent_process', None)
                         continue
                     text = session_snapshot(row, capture(row['name']))
+                    reply = row.get('reply') or {}
                     if row['agent'] and row['agent'] != 'pi':
-                        row['preview'] = last_request(drop_composer(text, row['agent']))
+                        # The text is read from the screen, its time from the CLI's record of the same message.
+                        row['preview'], row['preview_at'] = last_request(drop_composer(text, row['agent'])), reply.get('asked_at')
                     # Once the agent has answered, the card shows the start of the answer until the user sends
                     # the next message (the user's choice, 2026-11-23).
-                    answer = (row.get('reply') or {}).get('excerpt')
-                    if answer and row['state'] == 'idle':
-                        row['preview'] = answer
+                    if reply.get('excerpt') and row['state'] == 'idle':
+                        row['preview'], row['preview_at'] = reply['excerpt'], reply['at']
                 return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()},
                                         'options': models(), 'usage_supported': True})
             match = re.fullmatch(r'/api/usage/(codex|claude)', path)

@@ -43,7 +43,7 @@ class PiAgentTest(unittest.TestCase):
 
     def test_preview_and_reply_come_from_the_bound_transcript(self):
         def message(entry, parent, role, text, reason=None):
-            return dict(type='message', id=entry, parentId=parent,
+            return dict(type='message', id=entry, parentId=parent, timestamp=f'2026-11-21T09:0{entry}:00Z',
                         message={'role': role, 'stopReason': reason, 'content': [{'type': 'text', 'text': text}]})
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,7 +59,7 @@ class PiAgentTest(unittest.TestCase):
             tool_use = message('2', '1', 'assistant', '我先看看', 'toolUse')
             tool_result = message('3', '2', 'toolResult', '工具输出')
             first = snapshot(user, tool_use, tool_result)
-            self.assertEqual((first['preview'], first['reply']['id']), ('看一下 当前任务', None))
+            self.assertEqual((first['preview'], first['preview_at'], first['reply']['id']), ('看一下 当前任务', 1795251660000, None))
             final = message('4', '3', 'assistant', '这是正式回复', 'stop')
             second = snapshot(user, tool_use, tool_result, final)
             self.assertTrue(second['reply']['id'])
@@ -67,7 +67,7 @@ class PiAgentTest(unittest.TestCase):
             new_user = message('5', '4', 'user', '下一条请求')
             aborted = message('6', '5', 'assistant', '没说完', 'aborted')
             third = snapshot(user, tool_use, tool_result, final, new_user, aborted)
-            self.assertEqual(third['preview'], '下一条请求')
+            self.assertEqual((third['preview'], third['preview_at']), ('下一条请求', 1795251900000))
             # The user asked again: the same reply, without the excerpt the session list showed.
             self.assertEqual(third['reply'], {k: v for k, v in second['reply'].items() if k != 'excerpt'})
             # The page marks these messages as the user's bubbles.
@@ -78,7 +78,8 @@ class PiAgentTest(unittest.TestCase):
                 session = {'name': 'test'}
                 server.update_pi_turn(session)
                 self.assertEqual(server.pi_user_messages('test'), ((), '刚开始的任务'))
-            self.assertEqual((session['preview'], session['reply']['id']), ('刚开始的任务', None))
+            # Pi's extension publishes the request without the time it was sent.
+            self.assertEqual((session['preview'], session['preview_at'], session['reply']['id']), ('刚开始的任务', None, None))
 
     def test_recognizes_pi_process_without_saved_session_metadata(self):
         for command in ('123 01:02 pi   \n', '123 00:00 node /opt/homebrew/bin/pi --tui-mode regular\n'):

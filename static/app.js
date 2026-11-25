@@ -43,6 +43,13 @@ function show(view) {
 
 function esc(text) { return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function stateLabel(s) { return { busy: '运行中', idle: '空闲', exited: 'Agent 未运行' }[s] || '未知'; }
+// When the message on a card was sent, to the minute: the clock alone today, with the date before that.
+function sentAt(ms) {
+  const d = new Date(ms), now = new Date(), pad = (n) => String(n).padStart(2, '0');
+  const time = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  if (d.toDateString() === now.toDateString()) return time;
+  return (d.getFullYear() === now.getFullYear() ? '' : d.getFullYear() + '年') + (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + time;
+}
 
 // ---- home ----
 function listVisible() { return state.view === 'home' || (state.view === 'chat' && wideQuery.matches); }
@@ -71,7 +78,7 @@ function renderCards() {
   if (tapActive()) return;
   const cards = state.sessions.map((s) => {
     const unread = hasUnread(s) ? '<span class="dot unread" role="img" aria-label="有未读消息" title="有未读消息"></span>' : '';
-    return [s.name, `<div class="card${state.current?.name === s.name ? ' current' : ''}" data-name="${esc(s.name)}"><span class="dot ${s.state}"></span><div class="main"><b>${esc(s.nickname)}</b><span class="muted">${esc(s.name)} · ${stateLabel(s.state)}${s.attached ? ' · 终端已连接' : ''}</span>${s.preview ? `<span class="preview">${esc(s.preview)}</span>` : ''}</div>${unread}<span class="tag">${esc(s.agent_label)}</span></div>`];
+    return [s.name, `<div class="card${state.current?.name === s.name ? ' current' : ''}" data-name="${esc(s.name)}"><span class="dot ${s.state}"></span><div class="main"><b>${esc(s.nickname)}</b><span class="muted">${esc(s.name)} · ${stateLabel(s.state)}${s.attached ? ' · 终端已连接' : ''}</span>${s.preview ? `<span class="preview">${s.preview_at ? `<time>${sentAt(s.preview_at)}</time>` : ''}${esc(s.preview)}</span>` : ''}</div>${unread}<span class="tag">${esc(s.agent_label)}</span></div>`];
   });
   const list = $('list'), shown = [...list.querySelectorAll('.card')];
   if (!cards.length || shown.length !== cards.length || shown.some((el, n) => el.dataset.name !== cards[n][0])) {

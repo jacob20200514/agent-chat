@@ -189,13 +189,17 @@ class WorkingState(unittest.TestCase):
             def preview():
                 req = Request(f'http://127.0.0.1:{httpd.server_port}/api/sessions', headers={'Cookie': cookie})
                 with build_opener(ProxyHandler({})).open(req, timeout=5) as response:
-                    return json.load(response)['sessions'][0]['preview']
+                    row = json.load(response)['sessions'][0]
+                    return row['preview'], row['preview_at']
 
             try:
+                # Each with the time it was sent: the answer's, or the user's message's as the CLI recorded it.
+                asked, answered = '2026-11-21T09:00:00Z', '2026-11-21T09:03:00Z'
                 for reply, working, expected in (
-                        (('r', None, '修好了，已经上线'), False, '修好了，已经上线'),
-                        (('r', None, '修好了，已经上线'), True, '修好了吗'),  # a turn the user did not start
-                        (('r', None, None), False, '修好了吗'),  # asked again; that turn failed or was stopped
+                        (('r', answered, '修好了，已经上线', asked), False, ('修好了，已经上线', 1795251780000)),
+                        (('r', answered, '修好了，已经上线', asked), True, ('修好了吗', 1795251600000)),  # a turn the user did not start
+                        (('r', answered, None, asked), False, ('修好了吗', 1795251600000)),  # asked again; that turn failed or was stopped
+                        (None, False, ('修好了吗', None)),  # the CLI's records are not readable
                 ):
                     with self.subTest(reply=reply, working=working):
                         native['value'] = (server.reply_status.reply_status('claude:s', reply), working)
