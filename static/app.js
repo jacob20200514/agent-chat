@@ -3,9 +3,12 @@ const $ = (id) => document.getElementById(id);
 const state = { view: 'login', sessions: [], options: {}, agents: {}, current: null, text: null, version: null,
   timer: null, homeTimer: null, pollEpoch: 0, homeRequest: 0, visit: 0, failures: 0, stick: true, usageSupported: false };
 
+// A Blob body (a picture) is sent as it is; anything else as JSON.
 async function api(path, body, isCurrent = () => true) {
+  const raw = body instanceof Blob;
   const options = body === undefined ? { headers: { 'X-Agent-Chat': '1' } }
-    : { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat': '1' }, body: JSON.stringify(body) };
+    : { method: 'POST', headers: { 'Content-Type': raw ? body.type || 'application/octet-stream' : 'application/json', 'X-Agent-Chat': '1' },
+        body: raw ? body : JSON.stringify(body) };
   const response = await fetch(path, { ...options, credentials: 'same-origin', cache: 'no-store' });
   const data = await response.json().catch(() => ({}));
   if (response.status === 401 && path !== '/api/login') { if (isCurrent()) show('login'); throw new Error('请先登录'); }
@@ -120,6 +123,7 @@ function openCard(card) {
   if (!session) return;
   state.current = session; state.visit++;
   state.text = null; state.version = null; state.stick = true; state.failures = 0;
+  clearAttached();
   $('log').innerHTML = ''; setStatus(''); renderHeader(); show('chat');
   for (const el of $('list').querySelectorAll('.card')) el.classList.toggle('current', el === card);
 }
@@ -152,6 +156,7 @@ function renderHeader() {
   $('usage').hidden = !state.usageSupported || !usable || !['codex', 'claude', 'pi'].includes(s.agent);
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
   $('send').disabled = s.dead;
+  $('attach').hidden = !usable;
   $('input').placeholder = s.choice ? '在这里回复选项（如数字）后发送…' : usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
 }
 // The pane is one stream of text. Lines the CLI marks as the user's prompt become right-hand bubbles and
@@ -171,7 +176,9 @@ function menuRow(lines, i) {
 }
 // A long or multi-line message continues on lines indented two spaces, plus any indent of the user's own.
 // Replies that are indented too start with a tree glyph (└ ⎿) or a dot (⏺ ●); Codex shows the user's "- " as "•".
-const moreOfMessage = (line) => /^ {2}\s*[^\s└⎿├│⏺●]/.test(line || '');
+// Claude's folded tool summary ("Read 2 files (ctrl+o to expand)") sits under the message at the same indent.
+// Same rule as USER_MORE in server.py.
+const moreOfMessage = (line) => /^ {2}(?!.*\(ctrl\+o to expand\)\s*$)\s*[^\s└⎿├│⏺●]/.test(line || '');
 function blocks(text) {
   const out = []; let current = null;
   const push = (kind, line) => { if (!current || current.kind !== kind) { current = { kind, lines: [] }; out.push(current); } current.lines.push(line); };
@@ -279,16 +286,60 @@ input.addEventListener('keydown', (event) => {
   if (event.ctrlKey || event.metaKey) { input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end'); input.dispatchEvent(new Event('input')); }
   else $('compose').requestSubmit();
 });
+// Pictures for an agent: each is uploaded to the Mac when the message is sent, and the message ends with one
+// "图片：<path>" line per picture for the agent to open. The picked ones belong to the open conversation.
+const UPLOAD_LIMIT = 20 * 1024 * 1024; // server.py UPLOAD_LIMIT
+let attached = []; // { file, url, path }
+// Polling re-enables the send button every second; a second tap while pictures upload must not send twice.
+let sending = false;
+function renderAttached() {
+  $('attached').innerHTML = attached.map((item, i) =>
+    `<span class="thumb"><img src="${item.url}" alt=""><button type="button" data-drop="${i}" aria-label="移除这张图片">✕</button></span>`).join('');
+  $('attached').hidden = !attached.length;
+}
+function clearAttached() {
+  for (const item of attached) URL.revokeObjectURL(item.url);
+  attached = []; renderAttached();
+}
+$('attach').addEventListener('click', () => $('pick').click());
+$('pick').addEventListener('change', () => {
+  for (const file of $('pick').files) {
+    if (file.size > UPLOAD_LIMIT) setStatus('图片超过 20 MB，没有加入：' + file.name, true);
+    else attached.push({ file, url: URL.createObjectURL(file), path: null });
+  }
+  $('pick').value = ''; renderAttached();
+});
+$('attached').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-drop]'); if (!button) return;
+  URL.revokeObjectURL(attached.splice(Number(button.dataset.drop), 1)[0].url); renderAttached();
+});
 $('compose').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const text = input.value, visit = state.visit; if (!text.trim() || $('send').disabled) return;
+  const pictures = attached, visit = state.visit, isCurrent = () => visit === state.visit;
+  let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending) return;
   // One id per message: a retry after a dropped connection cannot type it into the agent twice.
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
-  $('send').disabled = true; state.stick = true;
-  const sent = await act('send', { text, id }, '发送中…', visit);
-  if (visit !== state.visit) return;
-  if (sent) { input.value = ''; input.style.height = 'auto'; }
-  $('send').disabled = false;
+  sending = true; $('send').disabled = true; state.stick = true;
+  try {
+    try {
+      // A picture already uploaded by a send that failed afterwards keeps its path.
+      for (const [i, item] of pictures.entries()) {
+        if (item.path) continue;
+        setStatus(`上传图片 ${i + 1}/${pictures.length}…`);
+        item.path = (await api('/api/upload', item.file, isCurrent)).path;
+      }
+    } catch (error) {
+      if (isCurrent()) setStatus(error.message, true);
+      return;
+    }
+    if (!isCurrent()) return;
+    if (pictures.length) text = (text.trim() ? text.trimEnd() : '请看图片') + '\n' + pictures.map((item) => '图片：' + item.path).join('\n');
+    const sent = await act('send', { text, id }, '发送中…', visit);
+    if (sent && isCurrent()) { input.value = ''; input.style.height = 'auto'; clearAttached(); }
+  } finally {
+    sending = false;
+    if (isCurrent()) $('send').disabled = !!state.current?.dead;
+  }
 });
 // Phone: a quick swipe to the right over the chat goes back to the session list. Rows that scroll sideways
 // and the input box keep their own horizontal gestures; a swipe that selected text is left alone.

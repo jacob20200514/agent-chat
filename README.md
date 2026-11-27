@@ -38,7 +38,7 @@ git clone https://github.com/jacob20200514/Agent-chat.git ~/agent-chat
 ## 日常
 
 - `agentchat start | stop | restart | status | logs`
-- 数据在 `~/.agent-chat/`：密码哈希与登录状态 `auth.json`、会话昵称 `sessions.json`、日志 `server.log`。
+- 数据在 `~/.agent-chat/`：密码哈希与登录状态 `auth.json`、会话昵称 `sessions.json`、日志 `server.log`、网页发的图片 `uploads/`。
 - 更新：`git pull` 后 `agentchat restart`。
 
 ## 行为
@@ -54,8 +54,9 @@ git clone https://github.com/jacob20200514/Agent-chat.git ~/agent-chat
 
   Claude 和 Codex 要保留"不用备用屏幕"的设置（`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`、`--no-alt-screen`），否则网页只能看到最后一屏；Codex 建议保留 `-c check_for_update_on_startup=false`，否则出新版时第一条消息的回车会触发自更新并退出。
   Pi 用 `pi --tui-mode regular` 启动以保留 tmux 历史，100 列下底部能完整显示模型和思考级别。`--approve` 用于信任项目配置和扩展，仅在想主动信任当前项目时使用。
-- 输出每秒读一次 `tmux capture-pane`（纯文本，最近 3000 行）；输入用带括号粘贴的 `paste-buffer` 再回车，多行消息不会被拆开。你发的消息显示为右侧气泡：Claude、Codex、CodeBuddy 认输入行的 ❯ / › / > 标记，消息里的空行、缩进行不会把它拆开；Pi 的消息没有标记，按它画的消息框认，并且要和该会话的 Pi 对话记录逐字对上（工具卡片的框一样，不会被认成你的消息），所以不是从网页新建的 Pi 会话只显示左侧气泡。Pi 底部的输入框和用量栏不放进对话，输入框里有草稿或开着选择菜单时照常显示。会话列表每张卡片下显示该会话里你最近发的一条消息（最多两行，斜杠命令不算）；Agent 答完这一轮、回到空闲后，改为显示它答复的开头，直到你发下一条。开头标着发送时间（到分钟；今天的只显示时分，更早的带日期）：你的消息取该 Agent 对话记录里这条消息的时间，答复取答完的时间；读不到记录时不显示，比如 Pi 第一轮还没写进记录时。是否答完、你有没有再发都读各 Agent 自己的对话记录，不看屏幕；你再发的消息失败或被打断时，仍显示你发的那条。手机上在对话页向右滑返回列表。电脑上回车发送，Ctrl+回车（或 Cmd/Shift+回车）换行；手机上回车是换行，点「发送」发送。
+- 输出每秒读一次 `tmux capture-pane`（纯文本，最近 3000 行）；输入用带括号粘贴的 `paste-buffer` 再回车，多行消息不会被拆开。你发的消息显示为右侧气泡：Claude、Codex、CodeBuddy 认输入行的 ❯ / › / > 标记，消息里的空行、缩进行不会把它拆开，紧跟在下面的 Claude 折叠工具摘要（以「(ctrl+o to expand)」结尾的一行）不算你的消息；Pi 的消息没有标记，按它画的消息框认，并且要和该会话的 Pi 对话记录逐字对上（工具卡片的框一样，不会被认成你的消息），所以不是从网页新建的 Pi 会话只显示左侧气泡。Pi 底部的输入框和用量栏不放进对话，输入框里有草稿或开着选择菜单时照常显示。会话列表每张卡片下显示该会话里你最近发的一条消息（最多两行，斜杠命令不算）；Agent 答完这一轮、回到空闲后，改为显示它答复的开头，直到你发下一条。开头标着发送时间（到分钟；今天的只显示时分，更早的带日期）：你的消息取该 Agent 对话记录里这条消息的时间，答复取答完的时间；读不到记录时不显示，比如 Pi 第一轮还没写进记录时。是否答完、你有没有再发都读各 Agent 自己的对话记录，不看屏幕；你再发的消息失败或被打断时，仍显示你发的那条。手机上在对话页向右滑返回列表。电脑上回车发送，Ctrl+回车（或 Cmd/Shift+回车）换行；手机上回车是换行，点「发送」发送。
 - 同一会话同一时刻只处理一个写操作；每条消息带编号，断线重试不会重复发送。
+- 发图片：Agent 会话的输入框左边有图片按钮（Shell 会话没有），可多选，选好的图在输入框上方显示缩略图，点 ✕ 移除。点发送时先把图片传到这台 Mac，存为 `~/.agent-chat/uploads/日期/时分秒-随机.扩展名`（只有你能读），再发出消息：你写的文字后面每张图一行「图片：路径」，没写文字时开头是「请看图片」。Agent 用自己的读文件工具打开这个路径（Claude、Pi 用读文件，Codex、CodeBuddy 用看图工具），能不能看懂取决于当前模型是否支持图片。只收 PNG、JPG、GIF、WebP，单张不超过 20 MB；按文件内容判断格式，不看扩展名。超过 30 天的日期文件夹在下次传图时删除。你的气泡里只显示路径文字。
 - 会话里跑的是 Shell 而不是 Agent 时，输入框发的文字直接敲进 Shell 并回车执行。切模型、切档位、新对话只对 Agent 会话可用。
 - Claude、Codex 和 CodeBuddy 的网页 Model / Effort 走各自 CLI 菜单的会话内切换。CodeBuddy 的 Effort 会改全局默认（页面上有提示）。在终端直接操作时，以 CLI 菜单标注的会话内与全局保存方式为准。
 - 打开 Model 时，Codex 通过本机 App Server、Claude 通过 Agent SDK、CodeBuddy 通过本机 ACP 读取模型。读取失败可关闭菜单后重试。Codex 的 Effort 也自动读取，Claude 和 CodeBuddy 的 Effort 选项来自 `models.json`。

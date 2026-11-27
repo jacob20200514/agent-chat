@@ -46,6 +46,11 @@ MIN_PASSWORD = 8
 REMEMBER_SECONDS = 30 * 86400
 SESSION_SECONDS = 12 * 3600
 HISTORY_LINES = 3000
+# Pictures sent from the page are kept here and the message carries their path; the agent opens the file with
+# its own reader. Day folders older than UPLOAD_DAYS are deleted when the next picture comes in (2026-11-27).
+UPLOADS = DATA / 'uploads'
+UPLOAD_LIMIT = 20 * 1024 * 1024
+UPLOAD_DAYS = 30
 
 # Default commands; zsh -ic gives them the login PATH and proxy env. A machine whose CLI needs another
 # launch line (a node version manager, other flags) overrides 'command' per agent in DATA/agents.json.
@@ -98,6 +103,33 @@ def save(name, value):
 
 def models():
     return json.loads((ROOT / 'models.json').read_text())
+
+
+def image_type(data):
+    """The formats every agent's file reader takes as a picture, told by their first bytes."""
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
+
+def save_upload(data, kind):
+    cutoff = time.strftime('%Y%m%d', time.localtime(time.time() - UPLOAD_DAYS * 86400))
+    UPLOADS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for folder in UPLOADS.iterdir():
+        if folder.is_dir() and re.fullmatch(r'\d{8}', folder.name) and folder.name < cutoff:
+            shutil.rmtree(folder)
+    folder = UPLOADS / time.strftime('%Y%m%d')
+    folder.mkdir(mode=0o700, exist_ok=True)
+    path = folder / ('%s-%s.%s' % (time.strftime('%H%M%S'), secrets.token_hex(3), kind))
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
+        file.write(data)
+    return str(path)
 
 
 # ---- password and login -------------------------------------------------------------------------
@@ -302,8 +334,9 @@ def drop_composer(text, agent=None):
 # At the margin: the agents indent their tool output, which may hold a prompt mark of its own.
 USER_LINE = re.compile(r'^([❯›>])\s+(\S.*)')
 # Continuation of a message: two spaces plus any indent of the user's own. Replies that are indented too start
-# with a tree glyph or a dot; Codex shows the user's "- " as "•".
-USER_MORE = re.compile(r'^ {2}(\s*[^\s└⎿├│⏺●].*)')
+# with a tree glyph or a dot; Codex shows the user's "- " as "•". Claude's folded tool summary ("  Read 2 files
+# (ctrl+o to expand)") sits right under the message at the same indent, and follows every picture sent.
+USER_MORE = re.compile(r'^ {2}(?!.*\(ctrl\+o to expand\)\s*$)(\s*[^\s└⎿├│⏺●].*)')
 MENU_HINT = re.compile(r'\b(?:enter|esc)\b.*\b(?:select|confirm|cancel|back|exit)\b', re.I)
 REPLY_OR_PROMPT = re.compile(r'^\s*[❯›>⏺●•✻✶✳✢✽·∴✔⎿└](\s|$)')
 
@@ -1156,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Referrer-Policy', 'no-referrer')
-        self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-ancestors 'none'")
         for key, value in headers:
             self.send_header(key, value)
         self.end_headers()
@@ -1266,6 +1299,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self.same_origin():
                 return self.reply(403, {'error': 'forbidden'})
+            if path == '/api/upload':
+                return self.upload()
             body = self.body()
             if path == '/api/login':
                 return self.login(body)
@@ -1371,6 +1406,22 @@ class Handler(BaseHTTPRequestHandler):
         with state_lock:
             login_failures.update(count=0, until=0.0)
         return self.logged_in(bool(body.get('remember')))
+
+    def upload(self):
+        """A picture's raw bytes in, its saved path out. The body is read only after the login and size checks;
+        a refused one stays unread, so the connection is closed rather than reused."""
+        length = int(self.headers.get('Content-Length') or 0)
+        if not login_valid(self.token()):
+            self.close_connection = True
+            return self.reply(401, {'error': '请先登录'})
+        if length > UPLOAD_LIMIT:
+            self.close_connection = True
+            return self.reply(413, {'error': '图片超过 %d MB' % (UPLOAD_LIMIT // 1024 // 1024)})
+        data = self.rfile.read(length)
+        kind = image_type(data)
+        if not kind:
+            return self.reply(400, {'error': '只支持 PNG、JPG、GIF、WebP 图片'})
+        return self.reply(200, {'path': save_upload(data, kind)})
 
     def logged_in(self, remember_me):
         cookie = COOKIE + '=' + new_login(remember_me) + self.cookie_flags() + ('; Max-Age=%d' % REMEMBER_SECONDS if remember_me else '')

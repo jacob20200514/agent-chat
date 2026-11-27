@@ -109,6 +109,13 @@ class UserMessages(unittest.TestCase):
                   '     › Ask Codex to do anything\n     … +54 lines (ctrl+o to expand)\n\n⏺ 看完了')
         self.assertEqual(self.server.last_request(claude), '看看 Codex 的屏幕')
 
+    def test_claude_folded_tool_summary_is_not_part_of_the_message(self):
+        # Claude 2.1.330 after a picture was sent (2026-11-27): the Read summary sits under the message.
+        claude = ('❯ 图片里的数字是多少？\n  图片：/Users/someone/.agent-chat/uploads/20261127/230834-ccf4f5.png\n'
+                  '  \n  Read 1 file (ctrl+o to expand)\n\n⏺ 数字 7381。\n\n✻ Cooked for 4s · done 11:08 PM')
+        self.assertEqual(self.server.last_request(claude),
+                         '图片里的数字是多少？图片：/Users/someone/.agent-chat/uploads/20261127/230834-ccf4f5.png')
+
     def test_codex_startup_input_box_is_not_a_message(self):
         session, text = self.snapshot('codex', CODEX_RAW)
         self.assertEqual(text.count('Ask Codex to do anything'), 1)
