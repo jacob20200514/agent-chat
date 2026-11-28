@@ -103,6 +103,41 @@ class VoiceAPI(unittest.TestCase):
         self.configure('import sys; print("sensitive path", file=sys.stderr); sys.exit(1)')
         self.assertEqual(self.request(audio), (503, {'code': 'VOICE_ENGINE', 'error': '本地转写暂不可用，请稍后重试或直接打字。'}))
 
+    def send(self, text='OpenClaw 和 Claude', **extra):
+        return self.request(json.dumps({'text': text, 'id': 'one-recording', **extra}).encode(), path='/api/sessions/demo/send')
+
+    def test_voice_text_goes_to_same_live_agent_only_once(self):
+        live = {'name': 'demo', 'agent': 'pi', 'created': 123, 'state': 'unknown', 'dead': False, '_agent_process': (700, 50)}
+        with patch.object(self.server, 'find_session', return_value=live), patch.object(self.server, 'screen', return_value='Ready'), \
+                patch.object(self.server, 'send_text') as send:
+            target = {'agent': 'pi', 'created': 123}
+            self.assertEqual(self.send(voice_session=target), (200, {}))
+            self.assertEqual(self.send(voice_session=target), (200, {'duplicate': True}))
+            send.assert_called_once_with('demo', 'OpenClaw 和 Claude')
+
+    def test_voice_send_rechecks_target_before_typing(self):
+        live = {'name': 'demo', 'agent': 'pi', 'created': 123, 'state': 'unknown', 'dead': False, '_agent_process': (700, 50)}
+        target = {'agent': 'pi', 'created': 123}
+        with patch.object(self.server, 'screen', return_value='Ready'), patch.object(self.server, 'send_text') as send:
+            for changed in ({'agent': None, 'state': 'exited'}, {'created': 124}, {'agent': 'codex'},
+                            {'dead': True}, {'_agent_process': None}):
+                with patch.object(self.server, 'find_session', side_effect=[live, live | changed]):
+                    self.assertEqual(self.send(voice_session=target)[1]['code'], 'VOICE_SESSION_CHANGED')
+            send.assert_not_called()
+            # Manual text can still be sent to Shell as before.
+            shell = live | {'agent': None, 'state': 'exited', '_agent_process': None}
+            with patch.object(self.server, 'find_session', return_value=shell):
+                self.assertEqual(self.send(text='manual text'), (200, {}))
+            send.assert_called_once_with('demo', 'manual text')
+
+    def test_voice_does_not_select_agent_menu_option(self):
+        live = {'name': 'demo', 'agent': 'claude', 'created': 123, 'state': 'unknown', 'dead': False, '_agent_process': (700, 50)}
+        with patch.object(self.server, 'find_session', return_value=live), \
+                patch.object(self.server, 'screen', return_value='❯ 1. Yes\n Esc to cancel'), \
+                patch.object(self.server, 'send_text') as send:
+            self.assertEqual(self.send(text='1', voice_session={'agent': 'claude', 'created': 123})[1]['code'], 'VOICE_CHOICE_OPEN')
+            send.assert_not_called()
+
     def test_busy_upload_does_not_block_other_requests(self):
         self.configure('print(1)')
         start = threading.Event()

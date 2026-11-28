@@ -11,7 +11,9 @@ HARNESS = r"""
 <script>
 const session = (name, agent) => ({name, nickname: name, agent, state: 'idle', created: 1});
 const sessions = {A: session('A', 'claude'), B: session('B', 'codex'), Shell: session('Shell', null)};
-let allowed = false, uploads = [], sends = [], releases = 0, requests = 0, pausePermission = false, grant;
+let allowed = false, uploads = [], sends = [], releases = 0, requests = 0, pausePermission = false, grant, voiceMenu = false;
+const output = {A: [], B: [], Shell: []};
+let imageUploads = 0;
 const response = (data, status = 200) => ({ok: status === 200, status, json: async () => data});
 Object.defineProperty(navigator, 'mediaDevices', {value: {getUserMedia: async () => {
   requests++;
@@ -34,10 +36,16 @@ window.fetch = async (url, options) => {
   if (url === '/api/me') return response({login: true, password_set: true});
   if (url === '/api/sessions') return response({sessions: Object.values(sessions), agents:{}, options:{}, transcription_supported: true});
   if (url === '/api/transcribe') return new Promise(resolve => uploads.push({options, reply: (data, status) => resolve(response(data, status))}));
-  if (url === '/api/upload') return response({path: '/tmp/test.png'});
+  if (url === '/api/upload') { imageUploads++; return response({path: '/tmp/test.png'}); }
   const [,name,action] = url.match(/^\/api\/sessions\/([^/]+)\/(\w+)/);
-  if (action === 'output') return response({session: sessions[name], text: 'Ready', version: 'v1'});
-  if (action === 'send') { sends.push({name, ...JSON.parse(options.body)}); return response({}); }
+  if (action === 'output') return response({session: sessions[name], text: ['Ready', ...output[name]].join('\n\n'), version: String(output[name].length)});
+  if (action === 'send') {
+    const body = JSON.parse(options.body);
+    sends.push({name, ...body});
+    if (voiceMenu) return response({code: 'VOICE_CHOICE_OPEN', error: '请先退出菜单'}, 409);
+    output[name].push('❯ ' + body.text);
+    return response({});
+  }
   throw Error(url);
 };
 const q = (id) => document.getElementById(id);
@@ -86,10 +94,13 @@ window.addEventListener('load', async () => {
     check(releases === 2 && uploads[0].options.body instanceof Blob &&
       uploads[0].options.body.type.includes(innerWidth < 900 ? 'mp4' : 'webm'), 'wrong recording body or mic left open');
     uploads[0].reply({text:'Termius 和 tmux'});
-    await wait(() => status().includes('点键盘'), 'transcript not added after release');
-    check(q('input').hidden && hold.textContent === '按住说话' && sends.length === 0, 'release sent text or unexpectedly exited voice mode');
+    await wait(() => status().includes('已发送'), 'transcript not sent after release');
+    check(q('input').hidden && hold.textContent === '按住说话' && sends.length === 1 && sends[0].name === 'A' &&
+      sends[0].text === 'Termius 和 tmux' && sends[0].voice_session.agent === 'claude' && sends[0].voice_session.created === 1 && imageUploads === 0,
+      'release did not send just the transcript to the original agent');
+    await wait(() => document.querySelector('#log .block.user')?.textContent.includes('Termius 和 tmux'), 'transcript did not become a user bubble');
     q('mic').click();
-    check(!q('input').hidden && hold.hidden && q('input').value === '原草稿\nTermius 和 tmux' && !q('attached').hidden, 'switching back lost draft or picture');
+    check(!q('input').hidden && hold.hidden && q('input').value === '原草稿' && !q('attached').hidden, 'switching back lost draft or picture');
     q('mic').click(); press(); await wait(recording, 'second recording failed');
     pointer('pointermove', 60); check(hold.textContent === '松开取消', 'upward cancellation not indicated');
     pointer('pointerup', 60); await sleep(30);
@@ -101,27 +112,28 @@ window.addEventListener('load', async () => {
     await wait(recording, 'keyboard hold failed');
     hold.dispatchEvent(new KeyboardEvent('keyup', {key:' '})); await wait(() => uploads.length === 2, 'missing keyboard upload');
     q('mic').click();
-    q('input').dispatchEvent(new CompositionEvent('compositionstart'));
+    q('input').value += '，还在编辑';
+    voiceMenu = true;
     uploads[1].reply({text:'第二段'});
-    await sleep(50);
-    check(q('input').value.endsWith('Termius 和 tmux') && sends.length === 0, 'IME was overwritten or text auto-sent');
-    q('input').value += '，还在编辑'; q('input').dispatchEvent(new CompositionEvent('compositionend'));
-    await wait(() => q('input').value.endsWith('第二段'), 'no transcript after IME finished');
-    check(q('input').value === '原草稿\nTermius 和 tmux，还在编辑\n第二段', 'overwrote typed text');
+    await wait(() => !q('voice-retry').hidden, 'voice retry not shown after a blocked send');
+    check(sends.length === 2 && q('input').value === '原草稿，还在编辑' && !q('attached').hidden, 'blocked voice overwrote draft or retried the menu');
+    voiceMenu = false; q('voice-retry').click();
+    await wait(() => sends.length === 3 && status().includes('已发送'), 'voice retry failed');
+    check(sends[2].id === sends[1].id && sends[2].text === '第二段' && imageUploads === 0 && q('input').value === '原草稿，还在编辑', 'voice retry changed text or its identity');
     q('mic').click(); press(); await wait(recording, 'failure recording did not start');
     release(); await wait(() => uploads.length === 3, 'missing third upload');
     uploads[2].reply({error:'测试转写失败'}, 503);
     await wait(() => status().includes('测试转写失败'), 'failure not displayed');
-    check(!q('attached').hidden && q('input').value.endsWith('第二段'), 'failure lost draft or image');
+    check(!q('attached').hidden && q('input').value === '原草稿，还在编辑' && sends.length === 3, 'failure lost draft or image or sent something');
     press(); await wait(recording, 'stale recording did not start');
     release(); await wait(() => uploads.length === 4, 'missing fourth upload');
     open('B'); q('input').value = 'B 的草稿'; open('A');
     uploads[3].reply({text:'这是迟到的录音'});
     await sleep(60);
-    check(uploads[3].options.signal.aborted && q('input').value.endsWith('第二段') && !q('input').value.includes('迟到') && hold.hidden, 'stale response modified revisited draft');
-    check(sends.length === 0, 'unexpected send');
-    q('send').click(); await wait(() => sends.length === 1 && !q('input').value && !q('send').disabled, 'manual send failed');
-    check(sends[0].name === 'A' && sends[0].text.endsWith('第二段'), 'incorrect manual send');
+    check(uploads[3].options.signal.aborted && q('input').value === '原草稿，还在编辑' && hold.hidden, 'stale response modified revisited draft');
+    check(sends.length === 3, 'stale transcription caused an unexpected send');
+    q('send').click(); await wait(() => sends.length === 4 && !q('input').value && !q('send').disabled, 'manual send failed');
+    check(sends[3].name === 'A' && sends[3].text === '原草稿，还在编辑' && !sends[3].voice_session, 'incorrect manual send');
     open('B'); check(q('input').value === 'B 的草稿', 'draft entered the wrong chat');
     open('Shell'); check(q('mic').hidden && !q('send').disabled, 'Shell unexpectedly got a microphone or lost send');
     result.textContent = 'PASS';

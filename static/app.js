@@ -265,8 +265,8 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => cancelVoice());
 
-async function act(action, body, working, visit = state.visit) {
-  const isCurrent = () => state.view === 'chat' && state.visit === visit;
+async function act(action, body, working, visit = state.visit, valid = () => true) {
+  const isCurrent = () => state.view === 'chat' && state.visit === visit && valid();
   const attempts = action === 'send' ? 3 : 1;
   for (let attempt = 0; attempt < attempts && isCurrent(); attempt++) {
     setStatus(working || '处理中…');
@@ -277,14 +277,16 @@ async function act(action, body, working, visit = state.visit) {
     } catch (error) {
       if (!isCurrent()) return false;
       setStatus(error.message, true);
-      if (['CODEX_USAGE_OPEN', 'CODEX_WARNINGS_OPEN', 'PI_PICKER_OPEN'].includes(error.code)) {
+      if (['CODEX_USAGE_OPEN', 'CODEX_WARNINGS_OPEN', 'PI_PICKER_OPEN', 'VOICE_CHOICE_OPEN'].includes(error.code)) {
         $('keys').classList.add('on');
         return false;
       }
+      if (error.code === 'VOICE_SESSION_CHANGED') return false;
     }
   }
   return false;
 }
+const newMessageId = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
 const input = $('input'), drafts = new Map();
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + 'px'; });
 function leaveComposer() {
@@ -293,7 +295,6 @@ function leaveComposer() {
     if (input.value) drafts.set(key, input.value);
     else drafts.delete(key);
   }
-  composing = false;
   voiceMode = false;
   cancelVoice();
   voiceStatus('');
@@ -301,7 +302,7 @@ function leaveComposer() {
 
 const VOICE_SECONDS = 120, VOICE_BYTES = 8 * 1024 * 1024;
 const mic = $('mic'), holdToTalk = $('voice-hold');
-let voice = null, voiceMode = false, composing = false;
+let voice = null, voiceMode = false;
 // WebKit advertises Opus/WebM, but its recordings can have broken audio timestamps.
 // Prefer Apple's AAC/MP4 path whenever available; keep WebM for browsers without MP4.
 const recordTypes = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
@@ -320,7 +321,7 @@ function renderVoice() {
   const usable = !!session?.agent && !session.dead && session.state !== 'exited';
   const available = usable && state.transcriptionSupported && !!recordType();
   if (!available) voiceMode = false;
-  if (voice && (!available || voice.key !== sessionKey(session))) cancelVoice('会话已变化，录音未使用。');
+  if (voice && (!available || voice.agent !== session.agent || voice.key !== sessionKey(session))) cancelVoice('Agent 会话已变化，已停止语音操作。');
   mic.hidden = !available;
   mic.disabled = sending;
   mic.classList.toggle('voice-mode', voiceMode);
@@ -332,15 +333,19 @@ function renderVoice() {
   const held = phase === 'recording' || phase === 'limit';
   holdToTalk.classList.toggle('listening', held);
   holdToTalk.classList.toggle('discard', !!voice?.discard);
-  holdToTalk.disabled = sending || phase === 'finishing';
-  const label = phase === 'finishing' ? '转写中…' : phase === 'permission' ? '正在开启麦克风…'
-    : held ? (voice.discard ? '松开取消' : '松开转文字') : '按住说话';
+  holdToTalk.disabled = sending || ['finishing', 'sending', 'failed'].includes(phase);
+  const label = phase === 'finishing' ? '转写中…' : phase === 'sending' ? '发送中…' : phase === 'failed' ? '语音文字未确认发送'
+    : phase === 'permission' ? '正在开启麦克风…' : held ? (voice.discard ? '松开取消' : '松开发送') : '按住说话';
   if (holdToTalk.textContent !== label) holdToTalk.textContent = label;
-  $('voice-cancel').hidden = !voice;
+  const cancel = $('voice-cancel');
+  cancel.hidden = !voice || phase === 'sending';
+  cancel.textContent = phase === 'failed' ? '关闭' : '取消';
+  $('voice-retry').hidden = phase !== 'failed';
   send.disabled = !!(session?.dead || sending || voice || voiceMode);
 }
 function activeVoice(job) {
-  return voice === job && state.view === 'chat' && state.visit === job.visit && state.current && sessionKey(state.current) === job.key;
+  return voice === job && state.view === 'chat' && state.visit === job.visit && state.current?.agent === job.agent
+    && sessionKey(state.current) === job.key;
 }
 function releaseMic(job) {
   const stream = job.stream;
@@ -366,7 +371,7 @@ function finishRecording(job, capped = false) {
   clearInterval(job.timer);
   job.recorder.stop();
   releaseMic(job);
-  voiceStatus(capped ? '已到录音上限，松开后转写。' : '转写中…'); renderVoice();
+  voiceStatus(capped ? '已到录音上限，松开后转写并发送。' : '转写中…'); renderVoice();
 }
 function releasePress(job) {
   if (job.discard) return cancelVoice('已取消录音。');
@@ -378,19 +383,19 @@ function releasePress(job) {
     if (job.stopped) uploadVoice(job);
   }
 }
-function insertTranscript(job) {
-  if (!activeVoice(job) || !job.text || composing) return;
-  const text = job.text;
-  input.value += (input.value && !input.value.endsWith('\n') ? '\n' : '') + text;
-  input.dispatchEvent(new Event('input'));
-  cancelVoice(voiceMode ? '已转写，点键盘查看文字。' : '已转写，请检查文字后发送。');
+async function sendVoice(job) {
+  if (!activeVoice(job) || !job.message || job.phase === 'sending') return;
+  job.phase = 'sending';
+  state.stick = true;
+  voiceStatus('正在发送语音文字…'); renderVoice();
+  // Same id for network retries and an explicit retry. The usual chat poll renders the real message.
+  const sent = await act('send', job.message, '发送语音文字…', job.visit, () => activeVoice(job));
+  if (!activeVoice(job)) return;
+  if (sent) return cancelVoice('已发送。');
+  job.phase = 'failed';
+  voiceStatus('语音文字未确认发送，可重试。', true); renderVoice();
 }
-input.addEventListener('compositionstart', () => { composing = true; });
-input.addEventListener('compositionend', () => {
-  composing = false;
-  const job = voice;
-  if (job?.text) setTimeout(() => insertTranscript(job), 0);
-});
+$('voice-retry').addEventListener('click', () => { if (voice?.phase === 'failed') sendVoice(voice); });
 async function uploadVoice(job) {
   if (!activeVoice(job)) return;
   const blob = new Blob(job.chunks, { type: job.recorder.mimeType || job.type });
@@ -401,8 +406,8 @@ async function uploadVoice(job) {
     const { text } = await api('/api/transcribe', blob, () => activeVoice(job), job.controller.signal);
     if (!activeVoice(job)) return;
     if (typeof text !== 'string' || !text.trim()) return cancelVoice('没有听到语音，请重新录制。', true);
-    job.text = text;
-    insertTranscript(job);
+    job.message = { text, id: newMessageId(), voice_session: { agent: job.agent, created: job.created } };
+    sendVoice(job);
   } catch (error) {
     if (activeVoice(job)) cancelVoice(error instanceof TypeError ? '录音上传失败，请检查连接后重录。' : error.message, true);
   }
@@ -411,7 +416,7 @@ mic.addEventListener('click', () => {
   if (mic.hidden || sending || !state.current) return;
   voiceMode = !voiceMode;
   if (voiceMode) input.blur();
-  else if (voice && voice.phase !== 'finishing') cancelVoice('已取消录音。');
+  else if (['permission', 'recording', 'limit'].includes(voice?.phase)) cancelVoice('已取消录音。');
   if (!voice) voiceStatus('');
   renderVoice();
   if (!voiceMode) { input.dispatchEvent(new Event('input')); input.focus(); }
@@ -419,7 +424,9 @@ mic.addEventListener('click', () => {
 async function startPress(trigger) {
   const type = recordType();
   if (!type || !voiceMode || voice || sending || !state.current) return;
-  const job = voice = { trigger, type, visit: state.visit, key: sessionKey(state.current), phase: 'permission', bytes: 0, chunks: [] };
+  const { agent, created } = state.current;
+  const job = voice = { trigger, type, visit: state.visit, key: sessionKey(state.current), agent, created,
+    phase: 'permission', bytes: 0, chunks: [] };
   voiceStatus('等待麦克风权限…'); renderVoice();
   try {
     job.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -462,8 +469,9 @@ holdToTalk.addEventListener('pointerdown', (event) => {
   event.preventDefault();
   startPress({ pointerId: event.pointerId, startY: event.clientY });
 });
+function holding(job) { return ['permission', 'recording', 'limit'].includes(job?.phase); }
 function updateDiscard(event) {
-  if (!voice || voice.trigger.pointerId !== event.pointerId || voice.phase === 'finishing') return false;
+  if (!holding(voice) || voice.trigger.pointerId !== event.pointerId) return false;
   const discard = event.clientY < voice.trigger.startY - 64;
   if (voice.discard !== discard) { voice.discard = discard; renderVoice(); }
   return true;
@@ -471,7 +479,7 @@ function updateDiscard(event) {
 holdToTalk.addEventListener('pointermove', updateDiscard);
 holdToTalk.addEventListener('pointerup', (event) => { if (updateDiscard(event)) releasePress(voice); });
 for (const eventName of ['pointercancel', 'lostpointercapture']) holdToTalk.addEventListener(eventName, (event) => {
-  if (voice?.trigger.pointerId === event.pointerId && voice.phase !== 'finishing') cancelVoice('已取消录音。');
+  if (holding(voice) && voice.trigger.pointerId === event.pointerId) cancelVoice('已取消录音。');
 });
 holdToTalk.addEventListener('contextmenu', (event) => event.preventDefault());
 holdToTalk.addEventListener('keydown', (event) => {
@@ -480,14 +488,14 @@ holdToTalk.addEventListener('keydown', (event) => {
   if (!event.repeat) startPress({ key: event.key });
 });
 holdToTalk.addEventListener('keyup', (event) => {
-  if (voice?.trigger.key !== event.key || voice.phase === 'finishing') return;
+  if (!holding(voice) || voice.trigger.key !== event.key) return;
   event.preventDefault();
   releasePress(voice);
 });
 holdToTalk.addEventListener('blur', () => {
-  if (voice?.trigger.key && voice.phase !== 'finishing') cancelVoice('已取消录音。');
+  if (holding(voice) && voice.trigger.key) cancelVoice('已取消录音。');
 });
-$('voice-cancel').addEventListener('click', () => cancelVoice('已取消录音。'));
+$('voice-cancel').addEventListener('click', () => cancelVoice(voice?.phase === 'failed' ? '' : '已取消录音。'));
 // With a hardware keyboard Enter sends and Ctrl+Enter (or Cmd/Shift+Enter) breaks the line. On a phone the
 // on-screen Enter stays a newline -- there is no Ctrl there -- and the send button sends.
 const hardwareKeys = matchMedia('(hover: hover) and (pointer: fine)');
@@ -530,7 +538,7 @@ $('compose').addEventListener('submit', async (event) => {
   const pictures = attached, visit = state.visit, isCurrent = () => visit === state.visit;
   let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending || voice || voiceMode) return;
   // One id per message: a retry after a dropped connection cannot type it into the agent twice.
-  const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const id = newMessageId();
   sending = true; renderVoice(); state.stick = true;
   try {
     try {

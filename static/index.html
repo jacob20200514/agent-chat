@@ -78,6 +78,7 @@ header small { display:block; font-size:12px; color:var(--muted); font-weight:40
 #voice-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 12px; font-size:12px; color:var(--muted); }
 #voice-row[hidden] { display:none; }
 #voice-row.error { color:var(--danger); }
+#voice-actions { display:flex; gap:6px; flex:none; }
 #voice-row button { min-height:30px; padding:2px 8px; }
 /* Pictures waiting to go with the next message, above the input box. */
 #attached { display:flex; gap:10px; padding:10px 12px 0; overflow-x:auto; border-top:1px solid var(--line); background:var(--panel); }
@@ -142,7 +143,7 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
   <div id="log"></div>
   <div id="status"></div>
   <div id="keys"><button data-key="Up">↑</button><button data-key="Down">↓</button><button data-key="Left">←</button><button data-key="Right">→</button><button data-key="Enter">Enter</button><button data-key="Escape">Esc</button><button data-key="Tab">Tab</button><button data-key="s">s</button><button data-key="y">y</button><button data-key="n">n</button><button data-key="1">1</button><button data-key="2">2</button><button data-key="3">3</button><button data-key="C-c">Ctrl-C</button></div>
-  <div id="voice-row" hidden><span id="voice-status" role="status" aria-live="polite"></span><button type="button" id="voice-cancel" hidden>取消</button></div>
+  <div id="voice-row" hidden><span id="voice-status" role="status" aria-live="polite"></span><span id="voice-actions"><button type="button" id="voice-retry" hidden>重试</button><button type="button" id="voice-cancel" hidden>取消</button></span></div>
   <div id="attached" hidden></div>
   <form id="compose">
     <button type="button" id="attach" aria-label="添加图片" title="添加图片"><span class="ui-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" focusable="false"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke-width="1.8"></rect><circle cx="9" cy="10" r="1.8" stroke-width="1.8"></circle><path d="M20.5 15.5 16 11l-8.5 8.5" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></button>

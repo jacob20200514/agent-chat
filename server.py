@@ -1365,16 +1365,28 @@ class Handler(BaseHTTPRequestHandler):
                         sent = seen_messages.setdefault(name, [])
                         if message_id and message_id in sent:
                             return self.reply(200, {'duplicate': True})
+                    from_voice = 'voice_session' in body
+                    if from_voice:
+                        # A released recording is not permission to type into a Shell or a new pane.
+                        current = find_session(name)
+                        source = body['voice_session']
+                        if (not isinstance(source, dict) or not current['agent'] or current['dead']
+                                or not current['_agent_process'] or current['state'] == 'exited'
+                                or source.get('agent') != current['agent'] or source.get('created') != current['created']):
+                            return self.reply(409, {'code': 'VOICE_SESSION_CHANGED', 'error': 'Agent 会话已变化，语音文字未发送。'})
+                        session = current
+                    view = screen(name) if from_voice or session['agent'] in ('codex', 'pi') else ''
                     if session['agent'] == 'codex':
-                        view = screen(name)
                         if codex_warnings_view(view):
                             return self.reply(409, {'code': 'CODEX_WARNINGS_OPEN',
                                                     'error': '未发送。请点「Esc」退出 Codex 警告面板后重发。'})
                         if codex_usage_view(view):
                             return self.reply(409, {'code': 'CODEX_USAGE_OPEN',
                                                     'error': '未发送。请点「Esc」退出 Codex 用量页后重发。'})
-                    if session['agent'] == 'pi' and pi_picker(screen(name)):
+                    if session['agent'] == 'pi' and pi_picker(view):
                         return self.reply(409, {'code': 'PI_PICKER_OPEN', 'error': '未发送。请点 Esc 退出 Pi 选择菜单后重发。'})
+                    if from_voice and choice_menu(view):
+                        return self.reply(409, {'code': 'VOICE_CHOICE_OPEN', 'error': 'Agent 正在等你选菜单；处理后再重试发送语音文字。'})
                     if session['agent'] in ('claude', 'codebuddy'):
                         clear_trust_prompt(name)
                     with state_lock:
