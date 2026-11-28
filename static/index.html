@@ -69,7 +69,13 @@ header small { display:block; font-size:12px; color:var(--muted); font-weight:40
 #keys button { min-width:48px; padding:4px 8px; min-height:36px; }
 #compose { display:flex; gap:8px; padding:8px 12px calc(8px + env(safe-area-inset-bottom)); border-top:1px solid var(--line); background:var(--panel); align-items:flex-end; }
 #compose button { white-space:nowrap; flex:none; }
-#compose textarea { resize:none; max-height:40vh; min-height:44px; }
+#compose textarea { resize:none; min-width:0; max-height:40vh; min-height:44px; }
+#mic .stop, #mic.recording .start { display:none; }
+#mic.recording .stop { display:inline-flex; color:var(--danger); }
+#voice-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 12px; font-size:12px; color:var(--muted); }
+#voice-row[hidden] { display:none; }
+#voice-row.error { color:var(--danger); }
+#voice-row button { min-height:30px; padding:2px 8px; }
 /* Pictures waiting to go with the next message, above the input box. */
 #attached { display:flex; gap:10px; padding:10px 12px 0; overflow-x:auto; border-top:1px solid var(--line); background:var(--panel); }
 #attached[hidden] { display:none; }
@@ -133,8 +139,14 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
   <div id="log"></div>
   <div id="status"></div>
   <div id="keys"><button data-key="Up">↑</button><button data-key="Down">↓</button><button data-key="Left">←</button><button data-key="Right">→</button><button data-key="Enter">Enter</button><button data-key="Escape">Esc</button><button data-key="Tab">Tab</button><button data-key="s">s</button><button data-key="y">y</button><button data-key="n">n</button><button data-key="1">1</button><button data-key="2">2</button><button data-key="3">3</button><button data-key="C-c">Ctrl-C</button></div>
+  <div id="voice-row" hidden><span id="voice-status" role="status" aria-live="polite"></span><button type="button" id="voice-cancel" hidden>取消</button></div>
   <div id="attached" hidden></div>
-  <form id="compose"><button type="button" id="attach" aria-label="添加图片" title="添加图片"><span class="ui-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" focusable="false"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke-width="1.8"></rect><circle cx="9" cy="10" r="1.8" stroke-width="1.8"></circle><path d="M20.5 15.5 16 11l-8.5 8.5" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></button><input type="file" id="pick" accept="image/*" multiple hidden><textarea id="input" rows="1" placeholder="发消息…" enterkeyhint="enter"></textarea><button class="primary" type="submit" id="send">发送</button></form>
+  <form id="compose">
+    <button type="button" id="attach" aria-label="添加图片" title="添加图片"><span class="ui-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" focusable="false"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke-width="1.8"></rect><circle cx="9" cy="10" r="1.8" stroke-width="1.8"></circle><path d="M20.5 15.5 16 11l-8.5 8.5" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg></span></button>
+    <button type="button" id="mic" hidden aria-label="开始录音" title="开始录音"><span class="ui-icon start" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" focusable="false" stroke-width="1.8" stroke-linecap="round"><rect x="9" y="3" width="6" height="12" rx="3"></rect><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M9 22h6"></path></svg></span><span class="ui-icon stop" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" focusable="false"><rect x="6" y="6" width="12" height="12" rx="2" stroke-width="1.8"></rect></svg></span></button>
+    <input type="file" id="pick" accept="image/*" multiple hidden>
+    <textarea id="input" rows="1" placeholder="发消息…" enterkeyhint="enter"></textarea><button class="primary" type="submit" id="send">发送</button>
+  </form>
 </section>
 
 <dialog id="sheet"><h3 id="sheet-title"></h3><p id="sheet-note" class="muted" style="margin:0"></p><div id="sheet-body"></div><div class="row" id="sheet-actions"></div></dialog>

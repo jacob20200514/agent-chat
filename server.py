@@ -30,6 +30,7 @@ from pathlib import Path
 
 import model_catalogs
 import reply_status
+import voice_transcription
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('AGENT_CHAT_HOME', Path.home() / '.agent-chat'))
@@ -84,6 +85,7 @@ state_lock = threading.Lock()
 session_locks = {}
 seen_messages = {}
 login_failures = {'count': 0, 'until': 0.0}
+voice_lock = threading.Lock()
 
 
 def load(name, default):
@@ -1255,7 +1257,8 @@ class Handler(BaseHTTPRequestHandler):
                     if reply.get('excerpt') and row['state'] == 'idle':
                         row['preview'], row['preview_at'] = reply['excerpt'], reply['at']
                 return self.reply(200, {'sessions': rows, 'agents': {k: v['label'] for k, v in AGENTS.items()},
-                                        'options': models(), 'usage_supported': True})
+                                        'options': models(), 'usage_supported': True,
+                                        'transcription_supported': voice_transcription.configuration(DATA) is not None})
             match = re.fullmatch(r'/api/usage/(codex|claude)', path)
             if match:
                 agent = match.group(1)
@@ -1295,10 +1298,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         try:
+            if path == '/api/transcribe':
+                # This endpoint never reuses a connection with an unread or partial upload.
+                self.close_connection = True
             if self.refused():
                 return
             if not self.same_origin():
                 return self.reply(403, {'error': 'forbidden'})
+            if path == '/api/transcribe':
+                return self.transcribe()
             if path == '/api/upload':
                 return self.upload()
             body = self.body()
@@ -1406,6 +1414,53 @@ class Handler(BaseHTTPRequestHandler):
         with state_lock:
             login_failures.update(count=0, until=0.0)
         return self.logged_in(bool(body.get('remember')))
+
+    def transcribe(self):
+        if not login_valid(self.token()):
+            return self.reply(401, {'error': '请先登录'})
+        config = voice_transcription.configuration(DATA)
+        if not config:
+            return self.reply(503, {'error': '这台 Mac 未配置本地语音转写。'})
+        length = self.headers.get('Content-Length', '')
+        if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1 or not re.fullmatch(r'[0-9]{1,10}', length):
+            return self.reply(400, {'error': '录音长度无效，请重新录制。'})
+        length = int(length)
+        if not length:
+            return self.reply(400, {'error': '没有收到录音，请重新录制。'})
+        if length > voice_transcription.MAX_BYTES:
+            return self.reply(413, {'error': '录音超过 8 MB，请录短一点。'})
+        if not voice_lock.acquire(blocking=False):
+            return self.reply(429, {'error': '正在转写另一段录音，请稍后重试。'})
+        start = time.monotonic()
+        try:
+            remaining, data = length, bytearray()
+            while remaining:
+                left = start + voice_transcription.UPLOAD_TIMEOUT - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(left)
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    return self.reply(400, {'error': '录音上传中断，请重新录制。'})
+                data.extend(chunk)
+                remaining -= len(chunk)
+            self.connection.settimeout(voice_transcription.UPLOAD_TIMEOUT)
+            text = voice_transcription.transcribe(data, config)
+            print('voice %.2fs ok' % (time.monotonic() - start), flush=True)
+            return self.reply(200, {'text': text})
+        except TimeoutError:
+            return self.reply(408, {'error': '录音上传超时，请重新录制。'})
+        except voice_transcription.VoiceError as exc:
+            print('voice %.2fs %s' % (time.monotonic() - start, exc.code), flush=True)
+            return self.reply(exc.status, {'code': exc.code, 'error': str(exc)})
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception:
+            # Do not expose paths, audio or transcript through exception messages.
+            print('voice %.2fs VOICE_INTERNAL' % (time.monotonic() - start), flush=True)
+            return self.reply(503, {'error': '本地转写暂不可用，请稍后重试或直接打字。'})
+        finally:
+            voice_lock.release()
 
     def upload(self):
         """A picture's raw bytes in, its saved path out. The body is read only after the login and size checks;

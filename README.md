@@ -70,6 +70,27 @@ git clone https://github.com/jacob20200514/Agent-chat.git ~/agent-chat
 - 「按键」一排是方向键、Enter、Esc、Tab 等，用来操作 CLI 弹出的菜单。完整终端操作仍用终端。
 - 宽度：所有 Agent 新建时都是 100 列。CLI 按窗格宽度自己断行，电脑窗口能整行显示；手机放不下时由网页把每行折成两行多，不会左右滚动，但表格、分隔线和代码会被折断。网页不提供改宽度的按钮：改窗格宽度时 Claude 不会重印之前的内容，每改一次，靠近底部的内容会在记录里多出一份（从几行到最后一整轮不等）。
 
+## 可选：网页本地语音转写
+
+麦克风在图片按钮右边。点一下录音，再点一下停止转写（最长 2 分钟）。文字加到当前输入框，已有草稿和图片不动；检查、修改后手动发送。仅运行中的 Agent 会话支持，Shell 不支持。取消、切会话或将网页切到后台会放弃这次录音。
+
+需要支持 `MediaRecorder` 的浏览器及安全上下文，手机请走 Tailscale HTTPS，普通 Tailscale IP 的 HTTP 页不能录音。开发测试可用本机 `localhost`。不启用时照常打字、发图或使用系统键盘听写。
+
+默认不开启、不安装或下载任何识别模型。Mac 管理者可在 `~/.agent-chat/transcription.json` 配置本地、非联网的识别命令，例如让安装好的 Qwen MLX 转写程序使用自己的模型和词表：
+
+```json
+{
+  "ffmpeg": "/opt/homebrew/bin/ffmpeg",
+  "command": [
+    "/absolute/path/to/venv/bin/python", "/absolute/path/to/transcribe.py",
+    "--backend", "qwen", "--model-dir", "/absolute/path/to/qwen-model",
+    "--prompt-file", "/absolute/path/to/qwen-prompt.txt", "--ffmpeg", "/opt/homebrew/bin/ffmpeg"
+  ]
+}
+```
+
+配置中的程序路径必须是绝对路径。服务端先解码录音为本地 WAV，将 WAV 文件路径作为命令最后一个参数，不经过 shell；命令在标准输出返回 UTF-8 转写文字，空输出代表没听到语音。仅接受 MP4 音频或 WebM，单段最多 8 MiB，同一时间处理一条。临时录音处理后清理，不保存为聊天附件，不向 Agent 发送音频或自动提交文字。移走配置文件并刷新网页即可停用，不影响其他功能。
+
 ## 没做的
 
 - 不渲染 ANSI 颜色、不做逐字流式；不做完整终端。

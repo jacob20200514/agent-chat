@@ -1,15 +1,16 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const state = { view: 'login', sessions: [], options: {}, agents: {}, current: null, text: null, version: null,
-  timer: null, homeTimer: null, pollEpoch: 0, homeRequest: 0, visit: 0, failures: 0, stick: true, usageSupported: false };
+  timer: null, homeTimer: null, pollEpoch: 0, homeRequest: 0, visit: 0, failures: 0, stick: true,
+  usageSupported: false, transcriptionSupported: false };
 
-// A Blob body (a picture) is sent as it is; anything else as JSON.
-async function api(path, body, isCurrent = () => true) {
+// A Blob body (a picture or recording) is sent as it is; anything else as JSON.
+async function api(path, body, isCurrent = () => true, signal) {
   const raw = body instanceof Blob;
   const options = body === undefined ? { headers: { 'X-Agent-Chat': '1' } }
     : { method: 'POST', headers: { 'Content-Type': raw ? body.type || 'application/octet-stream' : 'application/json', 'X-Agent-Chat': '1' },
         body: raw ? body : JSON.stringify(body) };
-  const response = await fetch(path, { ...options, credentials: 'same-origin', cache: 'no-store' });
+  const response = await fetch(path, { ...options, credentials: 'same-origin', cache: 'no-store', signal });
   const data = await response.json().catch(() => ({}));
   if (response.status === 401 && path !== '/api/login') { if (isCurrent()) show('login'); throw new Error('请先登录'); }
   if (!response.ok) {
@@ -36,8 +37,12 @@ function stopPolling() {
 function show(view) {
   stopPolling();
   if (view !== state.view && $('sheet').open) $('sheet').close();
+  if (view !== 'chat') {
+    leaveComposer();
+    if (view === 'login') drafts.clear();
+    state.current = null; state.visit++;
+  }
   state.view = view;
-  if (view !== 'chat') { state.current = null; state.visit++; }
   for (const name of ['login', 'home', 'chat']) $(name).classList.toggle('on', name === view);
   layout();
   if (listVisible()) pollHome();
@@ -64,7 +69,9 @@ async function pollHome() {
   try {
     const data = await api('/api/sessions', undefined, isCurrent);
     if (!isCurrent()) return;
-    Object.assign(state, { sessions: data.sessions, options: data.options, agents: data.agents, usageSupported: data.usage_supported === true });
+    Object.assign(state, { sessions: data.sessions, options: data.options, agents: data.agents,
+      usageSupported: data.usage_supported === true, transcriptionSupported: data.transcription_supported === true });
+    if (state.current) renderVoice();
     for (const session of data.sessions) {
       if (session.name !== state.current?.name) recordReply(session, false);
     }
@@ -121,7 +128,10 @@ function recordReply(s, read) {
 function openCard(card) {
   const session = state.sessions.find((s) => s.name === card.dataset.name);
   if (!session) return;
+  leaveComposer();
   state.current = session; state.visit++;
+  input.value = drafts.get(sessionKey(session)) || '';
+  input.dispatchEvent(new Event('input'));
   state.text = null; state.version = null; state.stick = true; state.failures = 0;
   clearAttached();
   $('log').innerHTML = ''; setStatus(''); renderHeader(); show('chat');
@@ -155,7 +165,7 @@ function renderHeader() {
   for (const id of ['model', 'effort', 'new']) $(id).disabled = !usable;
   $('usage').hidden = !state.usageSupported || !usable || !['codex', 'claude', 'pi'].includes(s.agent);
   // Text goes to any live pane: in a Shell session it is typed at the prompt and run.
-  $('send').disabled = s.dead;
+  renderVoice();
   $('attach').hidden = !usable;
   $('input').placeholder = s.choice ? '在这里回复选项（如数字）后发送…' : usable ? '发消息…' : s.dead ? '这个会话里的程序已退出' : '输入命令，发送后在 Shell 里执行';
 }
@@ -250,9 +260,10 @@ async function pollChat() {
   state.timer = setTimeout(pollChat, delay);
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) stopPolling();
+  if (document.hidden) { cancelVoice(); stopPolling(); }
   else if (state.view !== 'login') show(state.view);
 });
+window.addEventListener('pagehide', () => cancelVoice());
 
 async function act(action, body, working, visit = state.visit) {
   const isCurrent = () => state.view === 'chat' && state.visit === visit;
@@ -274,8 +285,141 @@ async function act(action, body, working, visit = state.visit) {
   }
   return false;
 }
-const input = $('input');
+const input = $('input'), drafts = new Map();
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + 'px'; });
+function leaveComposer() {
+  if (state.current) {
+    const key = sessionKey(state.current);
+    if (input.value) drafts.set(key, input.value);
+    else drafts.delete(key);
+  }
+  composing = false;
+  cancelVoice();
+  voiceStatus('');
+}
+
+const VOICE_SECONDS = 120, VOICE_BYTES = 8 * 1024 * 1024;
+const mic = $('mic');
+let voice = null, composing = false;
+const recordTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+function recordType() {
+  return window.isSecureContext && navigator.mediaDevices?.getUserMedia && window.MediaRecorder?.isTypeSupported
+    ? recordTypes.find((type) => MediaRecorder.isTypeSupported(type)) : undefined;
+}
+function voiceStatus(text, error = false) {
+  const status = $('voice-status');
+  if (status.textContent !== text) status.textContent = text;
+  $('voice-row').hidden = !text && !voice;
+  $('voice-row').classList.toggle('error', error);
+}
+function renderVoice() {
+  const session = state.current;
+  const usable = !!session?.agent && !session.dead && session.state !== 'exited';
+  if (voice && (!usable || voice.key !== sessionKey(session))) cancelVoice('会话已变化，录音未使用。');
+  mic.hidden = !usable || !state.transcriptionSupported || !recordType();
+  const recording = voice?.phase === 'recording';
+  mic.classList.toggle('recording', recording);
+  mic.disabled = !!(sending || (voice && !recording));
+  mic.title = recording ? '停止并转写' : '开始录音';
+  mic.setAttribute('aria-label', mic.title);
+  $('voice-cancel').hidden = !voice;
+  $('send').disabled = !!(session?.dead || sending || voice);
+}
+function activeVoice(job) {
+  return voice === job && state.view === 'chat' && state.visit === job.visit && state.current && sessionKey(state.current) === job.key;
+}
+function releaseMic(job) {
+  const stream = job.stream;
+  job.stream = null;
+  for (const track of stream?.getTracks() || []) track.stop();
+}
+function cancelVoice(message = '', error = false) {
+  const job = voice;
+  if (!job) return;
+  voice = null;
+  clearInterval(job.timer);
+  job.controller?.abort();
+  if (job.recorder && job.recorder.state !== 'inactive') job.recorder.stop();
+  releaseMic(job);
+  job.chunks.length = 0;
+  voiceStatus(message, error);
+  renderVoice();
+}
+function finishRecording(job) {
+  if (!activeVoice(job) || job.phase !== 'recording') return;
+  if (job.recorder.state === 'inactive') return cancelVoice('录音中断，请重新录制。', true);
+  job.phase = 'finishing';
+  clearInterval(job.timer);
+  job.recorder.stop();
+  releaseMic(job);
+  voiceStatus('转写中…'); renderVoice();
+}
+function insertTranscript(job) {
+  if (!activeVoice(job) || !job.text || composing) return;
+  const text = job.text;
+  input.value += (input.value && !input.value.endsWith('\n') ? '\n' : '') + text;
+  input.dispatchEvent(new Event('input'));
+  cancelVoice('已转写，请检查文字后发送。');
+}
+input.addEventListener('compositionstart', () => { composing = true; });
+input.addEventListener('compositionend', () => {
+  composing = false;
+  const job = voice;
+  if (job?.text) setTimeout(() => insertTranscript(job), 0);
+});
+async function uploadVoice(job) {
+  if (!activeVoice(job)) return;
+  if (job.phase !== 'finishing') return cancelVoice('录音中断，请重新录制。', true);
+  const blob = new Blob(job.chunks, { type: job.recorder.mimeType || job.type });
+  job.chunks.length = 0;
+  if (!blob.size) return cancelVoice('没有收到录音，请重新录制。', true);
+  job.controller = new AbortController();
+  try {
+    const { text } = await api('/api/transcribe', blob, () => activeVoice(job), job.controller.signal);
+    if (!activeVoice(job)) return;
+    if (typeof text !== 'string' || !text.trim()) return cancelVoice('没有听到语音，请重新录制。', true);
+    job.text = text;
+    insertTranscript(job);
+  } catch (error) {
+    if (activeVoice(job)) cancelVoice(error instanceof TypeError ? '录音上传失败，请检查连接后重录。' : error.message, true);
+  }
+}
+mic.addEventListener('click', async () => {
+  if (voice) return finishRecording(voice);
+  const type = recordType();
+  if (!type || mic.hidden || sending || !state.current) return;
+  const job = voice = { type, visit: state.visit, key: sessionKey(state.current), phase: 'permission', bytes: 0, chunks: [] };
+  voiceStatus('等待麦克风权限…'); renderVoice();
+  try {
+    job.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    if (!activeVoice(job)) { releaseMic(job); return; }
+    for (const track of job.stream.getTracks()) track.addEventListener('ended', () => {
+      if (activeVoice(job) && job.phase === 'recording') cancelVoice('麦克风已断开，请重新录制。', true);
+    });
+    job.recorder = new MediaRecorder(job.stream, { mimeType: type, audioBitsPerSecond: 64000 });
+    job.recorder.ondataavailable = ({ data }) => {
+      if (!activeVoice(job) || !data.size) return;
+      job.bytes += data.size;
+      if (job.bytes > VOICE_BYTES) cancelVoice('录音超过 8 MB，请录短一点。', true);
+      else job.chunks.push(data);
+    };
+    job.recorder.onstop = () => uploadVoice(job);
+    job.recorder.onerror = () => { if (activeVoice(job)) cancelVoice('录音中断，请重新录制。', true); };
+    job.recorder.start(1000);
+    job.phase = 'recording';
+    const start = performance.now();
+    voiceStatus('录音中 0 秒'); renderVoice();
+    job.timer = setInterval(() => {
+      const elapsed = (performance.now() - start) / 1000;
+      // Leave room for the codec's final frame so the server accepts the auto-stopped clip.
+      if (elapsed >= VOICE_SECONDS - 0.5) finishRecording(job);
+      else voiceStatus(`录音中 ${Math.floor(elapsed)} 秒`);
+    }, 250);
+  } catch (error) {
+    if (activeVoice(job)) cancelVoice(error.name === 'NotAllowedError' ? '麦克风权限未开启，请在浏览器设置中允许。' : '无法打开麦克风，请检查设备。', true);
+  }
+});
+$('voice-cancel').addEventListener('click', () => cancelVoice('已取消录音。'));
 // With a hardware keyboard Enter sends and Ctrl+Enter (or Cmd/Shift+Enter) breaks the line. On a phone the
 // on-screen Enter stays a newline -- there is no Ctrl there -- and the send button sends.
 const hardwareKeys = matchMedia('(hover: hover) and (pointer: fine)');
@@ -316,10 +460,10 @@ $('attached').addEventListener('click', (event) => {
 $('compose').addEventListener('submit', async (event) => {
   event.preventDefault();
   const pictures = attached, visit = state.visit, isCurrent = () => visit === state.visit;
-  let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending) return;
+  let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending || voice) return;
   // One id per message: a retry after a dropped connection cannot type it into the agent twice.
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
-  sending = true; $('send').disabled = true; state.stick = true;
+  sending = true; renderVoice(); state.stick = true;
   try {
     try {
       // A picture already uploaded by a send that failed afterwards keeps its path.
@@ -335,10 +479,10 @@ $('compose').addEventListener('submit', async (event) => {
     if (!isCurrent()) return;
     if (pictures.length) text = (text.trim() ? text.trimEnd() : '请看图片') + '\n' + pictures.map((item) => '图片：' + item.path).join('\n');
     const sent = await act('send', { text, id }, '发送中…', visit);
-    if (sent && isCurrent()) { input.value = ''; input.style.height = 'auto'; clearAttached(); }
+    if (sent && isCurrent()) { input.value = ''; input.style.height = 'auto'; clearAttached(); voiceStatus(''); }
   } finally {
     sending = false;
-    if (isCurrent()) $('send').disabled = !!state.current?.dead;
+    if (state.current) renderVoice();
   }
 });
 // Phone: a quick swipe to the right over the chat goes back to the session list. Rows that scroll sideways
