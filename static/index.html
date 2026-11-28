@@ -13,6 +13,7 @@
 <title>Agent Chat</title>
 <style>
 :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --text:#e8eaf0; --muted:#8b93a3; --accent:#10a37f; --danger:#ef5350; --user:#23324a; --warn:#e0a030; --unread:#3b82f6; }
+:root { --reading-size:12.5px; --reading-offset:calc(var(--reading-size) - 12.5px); }
 @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg:#f7f7f8; --panel:#ffffff; --line:#e1e3e8; --text:#1d2129; --muted:#6b7280; --user:#dcebff; } }
 :root[data-theme="light"] { --bg:#f7f7f8; --panel:#ffffff; --line:#e1e3e8; --text:#1d2129; --muted:#6b7280; --user:#dcebff; }
 .ui-icon { display:inline-flex; width:18px; height:18px; align-items:center; justify-content:center; }
@@ -37,13 +38,19 @@ header small { display:block; font-size:12px; color:var(--muted); font-weight:40
 .pad { padding:16px; }
 .muted { color:var(--muted); font-size:13px; }
 #login form { margin:auto; width:min(340px, 88vw); display:grid; gap:12px; }
-#list { flex:1; overflow:auto; overscroll-behavior:contain; padding:12px; display:grid; gap:10px; align-content:start; }
+#home header { flex-wrap:wrap; }
+#home h1 { flex:1 0 auto; font-size:calc(17px + var(--reading-offset)); }
+.home-actions { display:flex; gap:6px; }
+.home-actions button { padding-inline:8px; white-space:nowrap; }
+.home-actions [data-font-step] { min-width:36px; }
+#home .muted, #empty { font-size:calc(13px + var(--reading-offset)); }
+#list { flex:1; overflow:auto; overscroll-behavior:contain; padding:12px; display:grid; gap:10px; align-content:start; font-size:calc(16px + var(--reading-offset)); }
 .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:12px 14px; display:flex; align-items:center; gap:10px; }
 .card .main { flex:1; min-width:0; }
-.card .preview { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; font-size:13px; line-height:1.4; margin-top:4px; word-break:break-word; }
+.card .preview { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; font-size:calc(13px + var(--reading-offset)); line-height:1.4; margin-top:4px; word-break:break-word; }
 .card .preview time { color:var(--muted); margin-right:6px; font-variant-numeric:tabular-nums; }
 .card b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.tag { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+.tag { font-size:calc(12px + var(--reading-offset)); padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
 .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none; }
 .dot.busy { background:var(--warn); animation:pulse 1s infinite; } .dot.idle { background:var(--accent); } .dot.exited { background:var(--danger); }
 .dot.unread { background:var(--unread); }
@@ -53,7 +60,7 @@ header small { display:block; font-size:12px; color:var(--muted); font-weight:40
 #log { flex:1; overflow:auto; overscroll-behavior:contain; padding:12px; -webkit-overflow-scrolling:touch; }
 .block { margin:0 0 10px; position:relative; }
 /* Panes are 100 columns (server.py PANE_WIDTH): a phone wraps each long line instead of scrolling sideways. */
-.block pre { margin:0; white-space:pre-wrap; word-break:break-word; font:var(--log-size, 12.5px)/1.45 ui-monospace, "SF Mono", Menlo, monospace; }
+.block pre { margin:0; white-space:pre-wrap; word-break:break-word; font:var(--reading-size)/1.45 ui-monospace, "SF Mono", Menlo, monospace; }
 .block.user { margin-left:18%; background:var(--user); border-radius:14px 14px 4px 14px; padding:8px 12px; }
 .block.agent { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:10px 12px 30px; }
 .block .copy { position:absolute; right:6px; bottom:4px; min-height:24px; padding:1px 8px; font-size:12px; border:0; background:transparent; color:var(--muted); }
@@ -82,7 +89,6 @@ dialog h3 { margin:0 0 10px; }
 /* Desktop: the session list stays as a sidebar beside the chat; buttons keep their natural width. */
 body.wide #home.on, body.wide #home.side { display:flex; position:fixed; inset:0 auto 0 0; width:300px; border-right:1px solid var(--line); }
 body.wide #chat { margin-left:300px; }
-body.wide #home header { flex-wrap:wrap; }
 body.wide #home header h1 { flex-basis:100%; }
 body.wide #home header button { min-height:32px; padding:4px 10px; font-size:14px; }
 body.wide #back { display:none; }
@@ -111,7 +117,10 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
 </section>
 
 <section id="home" class="view">
-  <header><h1>Agent 会话</h1><button id="theme-toggle" type="button"></button><button id="create-open" class="primary">新建</button><button id="logout">退出</button></header>
+  <header><h1>Agent 会话</h1><div class="home-actions">
+    <button type="button" data-font-step="-1" aria-label="字体变小">−</button><button type="button" data-font-step="1" aria-label="字体变大">+</button>
+    <button id="theme-toggle" type="button"></button><button id="create-open" class="primary">新建</button><button id="logout">退出</button>
+  </div></header>
   <div id="list"></div>
   <p id="home-status" class="muted pad" style="margin:0"></p>
 </section>
@@ -119,7 +128,7 @@ body.wide #empty.on { display:flex; margin-left:300px; height:100dvh; align-item
 <p id="empty" class="muted">从左侧选择一个会话，或点「新建」。</p>
 
 <section id="chat" class="view">
-  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button id="font-down" aria-label="字体变小">−</button><button id="font-up" aria-label="字体变大">+</button><button id="rename">改名</button></header>
+  <header><button id="back" aria-label="返回">‹</button><span id="chat-dot" class="dot"></span><h1><span id="chat-name"></span><small id="chat-sub"></small></h1><button type="button" data-font-step="-1" aria-label="字体变小">−</button><button type="button" data-font-step="1" aria-label="字体变大">+</button><button id="rename">改名</button></header>
   <div class="bar"><button id="model">Model</button><button id="effort">Effort</button><button id="new">New</button><button id="usage" type="button" hidden>额度</button><button id="keys-toggle">按键</button><button id="kill" class="danger">关闭 tmux</button></div>
   <div id="log"></div>
   <div id="status"></div>

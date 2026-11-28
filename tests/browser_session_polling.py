@@ -15,6 +15,7 @@ const rows = Object.fromEntries(['A', 'B'].map((name) => [name, {
   created: 1, state: 'idle', dead: false, reply: {scope: name, id: 'old', at: Date.now() - 60000},
 }]));
 const output = {A: ['a1', 'A 的旧回复'], B: ['b1', 'B 的旧回复']};
+rows.B.preview = 'B 的消息预览';
 const calls = [], usageReads = [];
 let hold, hidden = false, resetCount = 3;
 Object.defineProperty(document, 'hidden', {get: () => hidden});
@@ -323,11 +324,54 @@ async function run() {
   check(JSON.stringify(bubbles) === JSON.stringify(['1. 第一项\n2. 第二项\n   缩进的补充说明', '看这个：\ncode line\n    indented code\n只回复收到']),
     'user bubbles are split wrongly: ' + JSON.stringify(bubbles));
 }
+function checkTextSize(offset, chat = false) {
+  const sizes = {'#home h1': 17, '.card b': 16, '.card .muted': 13, '.card .preview': 13, '.card .tag': 12};
+  if (chat) sizes['#log pre'] = 12.5;
+  for (const [selector, baseline] of Object.entries(sizes)) {
+    const size = getComputedStyle(document.querySelector(selector)).fontSize;
+    check(size === `${baseline + offset}px`, `${selector} has size ${size}, expected ${baseline + offset}px`);
+  }
+}
+function adjustTextSize(view, step) {
+  const button = document.querySelector(`#${view} [data-font-step="${step}"]`);
+  const rect = button?.getBoundingClientRect();
+  check(rect?.width > 0 && rect.right <= innerWidth, `font step ${step} is not visible on ${view}`);
+  button.click();
+}
 window.addEventListener('load', async () => {
   const result = document.body.appendChild(document.createElement('pre'));
   result.id = 'browser-result';
-  try { await run(); result.textContent = 'PASS'; }
-  catch (error) { result.textContent = 'FAIL ' + error.message; }
+  try {
+    const reloaded = sessionStorage.getItem('fontReload');
+    await until(() => card('B'), 'session list did not load for font test');
+    checkTextSize(reloaded ? 2 : 0);
+    if (!reloaded) {
+      adjustTextSize('home', -1);
+      checkTextSize(-1);
+      adjustTextSize('home', 1);
+      adjustTextSize('home', 1);
+    }
+    open('B');
+    await until(() => message().includes('B 的旧回复'), 'font test chat did not render');
+    checkTextSize(reloaded ? 2 : 1, true);
+    if (!reloaded) {
+      adjustTextSize('chat', -1);
+      checkTextSize(0, true);
+      adjustTextSize('chat', 1);
+      checkTextSize(1, true);
+      adjustTextSize('chat', 1);
+    }
+    document.querySelector('#back').click();
+    check(document.querySelector('#home.on'), 'font test did not return to home');
+    checkTextSize(2);
+    if (!reloaded) {
+      sessionStorage.setItem('fontReload', '1');
+      location.reload();
+      return;
+    }
+    await run();
+    result.textContent = 'PASS';
+  } catch (error) { result.textContent = 'FAIL ' + error.message; }
 });
 </script>
 """

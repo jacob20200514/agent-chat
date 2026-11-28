@@ -562,18 +562,24 @@ $('logout').addEventListener('click', async () => { try { await api('/api/logout
   } catch (_) { show('login'); }
 })();
 
-// ---- chat text size (per device) ----
-function setLogSize(px) {
-  px = Math.min(20, Math.max(10, px));
-  document.documentElement.style.setProperty('--log-size', px + 'px');
-  try { localStorage.setItem('logSize', px); } catch (_) {}
-  return px;
+// ---- reading size shared by the chat and home (per browser) ----
+const clampReadingSize = (px) => Math.min(20, Math.max(10, px));
+let readingSize = 12.5;
+function applyReadingSize() { document.documentElement.style.setProperty('--reading-size', readingSize + 'px'); }
+try {
+  // Keep the original key so sizes chosen before the home page used it still apply.
+  const saved = Number(localStorage.getItem('logSize')?.trim() || NaN);
+  if (Number.isFinite(saved)) readingSize = clampReadingSize(saved);
+} catch (_) {}
+applyReadingSize();
+function changeReadingSize(step) {
+  readingSize = clampReadingSize(readingSize + step);
+  applyReadingSize();
+  try { localStorage.setItem('logSize', String(readingSize)); } catch (_) {}
 }
-let logSize = 12.5;
-try { logSize = Number(localStorage.getItem('logSize')) || logSize; } catch (_) {}
-logSize = setLogSize(logSize);
-$('font-down').addEventListener('click', () => { logSize = setLogSize(logSize - 1); });
-$('font-up').addEventListener('click', () => { logSize = setLogSize(logSize + 1); });
+for (const button of document.querySelectorAll('[data-font-step]')) {
+  button.addEventListener('click', () => changeReadingSize(Number(button.dataset.fontStep)));
+}
 
 // ---- light / dark (per device; follows the system until chosen). Icons are autotrade's. ----
 function themeIconSvg(iconName) {
