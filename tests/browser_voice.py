@@ -17,9 +17,10 @@ Object.defineProperty(navigator, 'mediaDevices', {value: {getUserMedia: async ()
   if (!allowed) throw new DOMException('denied', 'NotAllowedError');
   return {getTracks: () => [{stop: () => releases++, addEventListener() {}}]};
 }}});
-// Stand in for Safari's audio/mp4 output in the narrow layout, not for WebKit itself.
+// Safari can advertise both formats, but its WebM can contain broken audio timestamps.
+// Exercise MP4 preference and the fallback on browsers without MP4.
 window.MediaRecorder = class {
-  static isTypeSupported(type) { return innerWidth < 900 ? type === 'audio/mp4' : type === 'audio/webm;codecs=opus'; }
+  static isTypeSupported(type) { return type === 'audio/webm;codecs=opus' || (innerWidth < 900 && type === 'audio/mp4'); }
   constructor(_, {mimeType}) { this.mimeType = mimeType; this.state = 'inactive'; }
   start() { this.state = 'recording'; }
   stop() {

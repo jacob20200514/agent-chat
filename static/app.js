@@ -301,7 +301,9 @@ function leaveComposer() {
 const VOICE_SECONDS = 120, VOICE_BYTES = 8 * 1024 * 1024;
 const mic = $('mic');
 let voice = null, composing = false;
-const recordTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+// WebKit advertises Opus/WebM, but its recordings can have broken audio timestamps.
+// Prefer Apple's AAC/MP4 path whenever available; keep WebM for browsers without MP4.
+const recordTypes = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
 function recordType() {
   return window.isSecureContext && navigator.mediaDevices?.getUserMedia && window.MediaRecorder?.isTypeSupported
     ? recordTypes.find((type) => MediaRecorder.isTypeSupported(type)) : undefined;
