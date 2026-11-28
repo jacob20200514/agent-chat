@@ -11,10 +11,12 @@ HARNESS = r"""
 <script>
 const session = (name, agent) => ({name, nickname: name, agent, state: 'idle', created: 1});
 const sessions = {A: session('A', 'claude'), B: session('B', 'codex'), Shell: session('Shell', null)};
-let allowed = false, uploads = [], sends = [], releases = 0;
+let allowed = false, uploads = [], sends = [], releases = 0, requests = 0, pausePermission = false, grant;
 const response = (data, status = 200) => ({ok: status === 200, status, json: async () => data});
 Object.defineProperty(navigator, 'mediaDevices', {value: {getUserMedia: async () => {
+  requests++;
   if (!allowed) throw new DOMException('denied', 'NotAllowedError');
+  if (pausePermission) await new Promise(resolve => { grant = resolve; });
   return {getTracks: () => [{stop: () => releases++, addEventListener() {}}]};
 }}});
 // Safari can advertise both formats, but its WebM can contain broken audio timestamps.
@@ -50,7 +52,12 @@ function open(name) {
   document.querySelector(`.card[data-name="${name}"]`).click();
 }
 const status = () => q('voice-status').textContent;
-const recording = () => q('mic').classList.contains('recording');
+const recording = () => q('voice-hold').classList.contains('listening');
+function pointer(type, y = 160) {
+  q('voice-hold').dispatchEvent(new PointerEvent(type, {pointerId: 1, isPrimary: true, button: 0, clientY: y, cancelable: true, bubbles: true}));
+}
+const press = () => pointer('pointerdown');
+const release = () => pointer('pointerup');
 const enter = (opts) => q('input').dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', cancelable:true, ...opts}));
 window.addEventListener('load', async () => {
   const result = document.body.appendChild(document.createElement('pre')); result.id = 'voice-test';
@@ -59,41 +66,62 @@ window.addEventListener('load', async () => {
     open('A');
     check(q('attach').nextElementSibling === q('mic') && !q('mic').hidden &&
       q('input').getBoundingClientRect().width >= 100 && q('send').getBoundingClientRect().right <= innerWidth, 'composer layout');
-    q('mic').click(); await wait(() => status().includes('权限未开启'), 'permission failure');
-    allowed = true;
     q('input').value = '原草稿';
     const files = new DataTransfer(); files.items.add(new File(['img'], 'one.png', {type:'image/png'}));
     q('pick').files = files.files; q('pick').dispatchEvent(new Event('change'));
-    q('mic').click(); await wait(recording, 'did not record');
+    q('mic').click();
+    const hold = q('voice-hold');
+    check(q('input').hidden && q('send').hidden && !hold.hidden && hold.getBoundingClientRect().width >= 180 &&
+      hold.textContent === '按住说话' && requests === 0 && q('mic').title === '切换到文字输入', 'mode must replace input without starting the microphone');
+    press(); await wait(() => status().includes('权限未开启'), 'permission failure');
+    allowed = true; pausePermission = true;
+    press(); await wait(() => grant, 'permission request not pending'); release(); grant();
+    await wait(() => releases === 1, 'late permission leaked microphone');
+    check(uploads.length === 0 && !recording(), 'releasing before permission uploaded an audio clip');
+    pausePermission = false;
+    press(); await wait(recording, 'did not record');
     q('compose').requestSubmit(); enter({});
-    check(q('send').disabled && sends.length === 0 && uploads.length === 0, 'recording sent a message');
-    q('mic').click(); await wait(() => uploads.length === 1, 'no upload after stop');
-    check(releases === 1 && uploads[0].options.body instanceof Blob &&
+    check(q('send').disabled && sends.length === 0 && uploads.length === 0, 'holding sent a message');
+    release(); await wait(() => uploads.length === 1, 'no upload after release');
+    check(releases === 2 && uploads[0].options.body instanceof Blob &&
       uploads[0].options.body.type.includes(innerWidth < 900 ? 'mp4' : 'webm'), 'wrong recording body or mic left open');
-    q('input').dispatchEvent(new CompositionEvent('compositionstart'));
     uploads[0].reply({text:'Termius 和 tmux'});
+    await wait(() => status().includes('点键盘'), 'transcript not added after release');
+    check(q('input').hidden && hold.textContent === '按住说话' && sends.length === 0, 'release sent text or unexpectedly exited voice mode');
+    q('mic').click();
+    check(!q('input').hidden && hold.hidden && q('input').value === '原草稿\nTermius 和 tmux' && !q('attached').hidden, 'switching back lost draft or picture');
+    q('mic').click(); press(); await wait(recording, 'second recording failed');
+    pointer('pointermove', 60); check(hold.textContent === '松开取消', 'upward cancellation not indicated');
+    pointer('pointerup', 60); await sleep(30);
+    check(releases === 3 && uploads.length === 1, 'slide to cancel uploaded or leaked mic');
+    press(); await wait(recording, 'third recording failed');
+    pointer('pointercancel'); await sleep(30);
+    check(releases === 4 && uploads.length === 1, 'interrupted press uploaded or leaked mic');
+    hold.focus(); hold.dispatchEvent(new KeyboardEvent('keydown', {key:' '}));
+    await wait(recording, 'keyboard hold failed');
+    hold.dispatchEvent(new KeyboardEvent('keyup', {key:' '})); await wait(() => uploads.length === 2, 'missing keyboard upload');
+    q('mic').click();
+    q('input').dispatchEvent(new CompositionEvent('compositionstart'));
+    uploads[1].reply({text:'第二段'});
     await sleep(50);
-    check(q('input').value === '原草稿' && sends.length === 0, 'IME was overwritten or text auto-sent');
+    check(q('input').value.endsWith('Termius 和 tmux') && sends.length === 0, 'IME was overwritten or text auto-sent');
     q('input').value += '，还在编辑'; q('input').dispatchEvent(new CompositionEvent('compositionend'));
-    await wait(() => q('input').value.endsWith('Termius 和 tmux'), 'no transcript after IME finished');
-    check(q('input').value === '原草稿，还在编辑\nTermius 和 tmux' && !q('attached').hidden, 'lost a draft or picture');
-    q('mic').click(); await wait(recording, 'second recording failed');
-    q('voice-cancel').click(); await sleep(30);
-    check(releases === 2 && uploads.length === 1 && !q('send').disabled, 'cancel uploaded or leaked mic');
-    q('mic').click(); await wait(recording, 'third recording failed');
-    q('mic').click(); await wait(() => uploads.length === 2, 'missing second upload');
-    uploads[1].reply({error:'测试转写失败'}, 503);
+    await wait(() => q('input').value.endsWith('第二段'), 'no transcript after IME finished');
+    check(q('input').value === '原草稿\nTermius 和 tmux，还在编辑\n第二段', 'overwrote typed text');
+    q('mic').click(); press(); await wait(recording, 'failure recording did not start');
+    release(); await wait(() => uploads.length === 3, 'missing third upload');
+    uploads[2].reply({error:'测试转写失败'}, 503);
     await wait(() => status().includes('测试转写失败'), 'failure not displayed');
-    check(!q('attached').hidden && q('input').value.endsWith('Termius 和 tmux'), 'failure lost draft or image');
-    q('mic').click(); await wait(recording, 'fourth recording failed');
-    q('mic').click(); await wait(() => uploads.length === 3, 'missing third upload');
+    check(!q('attached').hidden && q('input').value.endsWith('第二段'), 'failure lost draft or image');
+    press(); await wait(recording, 'stale recording did not start');
+    release(); await wait(() => uploads.length === 4, 'missing fourth upload');
     open('B'); q('input').value = 'B 的草稿'; open('A');
-    uploads[2].reply({text:'这是迟到的录音'});
+    uploads[3].reply({text:'这是迟到的录音'});
     await sleep(60);
-    check(uploads[2].options.signal.aborted && q('input').value.endsWith('Termius 和 tmux') && !q('input').value.includes('迟到'), 'stale response modified revisited draft');
+    check(uploads[3].options.signal.aborted && q('input').value.endsWith('第二段') && !q('input').value.includes('迟到') && hold.hidden, 'stale response modified revisited draft');
     check(sends.length === 0, 'unexpected send');
     q('send').click(); await wait(() => sends.length === 1 && !q('input').value && !q('send').disabled, 'manual send failed');
-    check(sends[0].name === 'A' && sends[0].text.endsWith('Termius 和 tmux'), 'incorrect manual send');
+    check(sends[0].name === 'A' && sends[0].text.endsWith('第二段'), 'incorrect manual send');
     open('B'); check(q('input').value === 'B 的草稿', 'draft entered the wrong chat');
     open('Shell'); check(q('mic').hidden && !q('send').disabled, 'Shell unexpectedly got a microphone or lost send');
     result.textContent = 'PASS';

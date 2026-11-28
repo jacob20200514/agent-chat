@@ -294,13 +294,14 @@ function leaveComposer() {
     else drafts.delete(key);
   }
   composing = false;
+  voiceMode = false;
   cancelVoice();
   voiceStatus('');
 }
 
 const VOICE_SECONDS = 120, VOICE_BYTES = 8 * 1024 * 1024;
-const mic = $('mic');
-let voice = null, composing = false;
+const mic = $('mic'), holdToTalk = $('voice-hold');
+let voice = null, voiceMode = false, composing = false;
 // WebKit advertises Opus/WebM, but its recordings can have broken audio timestamps.
 // Prefer Apple's AAC/MP4 path whenever available; keep WebM for browsers without MP4.
 const recordTypes = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'];
@@ -317,15 +318,26 @@ function voiceStatus(text, error = false) {
 function renderVoice() {
   const session = state.current;
   const usable = !!session?.agent && !session.dead && session.state !== 'exited';
-  if (voice && (!usable || voice.key !== sessionKey(session))) cancelVoice('会话已变化，录音未使用。');
-  mic.hidden = !usable || !state.transcriptionSupported || !recordType();
-  const recording = voice?.phase === 'recording';
-  mic.classList.toggle('recording', recording);
-  mic.disabled = !!(sending || (voice && !recording));
-  mic.title = recording ? '停止并转写' : '开始录音';
+  const available = usable && state.transcriptionSupported && !!recordType();
+  if (!available) voiceMode = false;
+  if (voice && (!available || voice.key !== sessionKey(session))) cancelVoice('会话已变化，录音未使用。');
+  mic.hidden = !available;
+  mic.disabled = sending;
+  mic.classList.toggle('voice-mode', voiceMode);
+  mic.title = voiceMode ? '切换到文字输入' : '切换到按住说话';
   mic.setAttribute('aria-label', mic.title);
+  const send = $('send'), phase = voice?.phase;
+  input.hidden = send.hidden = voiceMode;
+  holdToTalk.hidden = !voiceMode;
+  const held = phase === 'recording' || phase === 'limit';
+  holdToTalk.classList.toggle('listening', held);
+  holdToTalk.classList.toggle('discard', !!voice?.discard);
+  holdToTalk.disabled = sending || phase === 'finishing';
+  const label = phase === 'finishing' ? '转写中…' : phase === 'permission' ? '正在开启麦克风…'
+    : held ? (voice.discard ? '松开取消' : '松开转文字') : '按住说话';
+  if (holdToTalk.textContent !== label) holdToTalk.textContent = label;
   $('voice-cancel').hidden = !voice;
-  $('send').disabled = !!(session?.dead || sending || voice);
+  send.disabled = !!(session?.dead || sending || voice || voiceMode);
 }
 function activeVoice(job) {
   return voice === job && state.view === 'chat' && state.visit === job.visit && state.current && sessionKey(state.current) === job.key;
@@ -347,21 +359,31 @@ function cancelVoice(message = '', error = false) {
   voiceStatus(message, error);
   renderVoice();
 }
-function finishRecording(job) {
+function finishRecording(job, capped = false) {
   if (!activeVoice(job) || job.phase !== 'recording') return;
   if (job.recorder.state === 'inactive') return cancelVoice('录音中断，请重新录制。', true);
-  job.phase = 'finishing';
+  job.phase = capped ? 'limit' : 'finishing';
   clearInterval(job.timer);
   job.recorder.stop();
   releaseMic(job);
-  voiceStatus('转写中…'); renderVoice();
+  voiceStatus(capped ? '已到录音上限，松开后转写。' : '转写中…'); renderVoice();
+}
+function releasePress(job) {
+  if (job.discard) return cancelVoice('已取消录音。');
+  if (job.phase === 'permission') return cancelVoice('麦克风开启后，请再按住说话。');
+  if (job.phase === 'recording') return finishRecording(job);
+  if (job.phase === 'limit') {
+    job.phase = 'finishing';
+    voiceStatus('转写中…'); renderVoice();
+    if (job.stopped) uploadVoice(job);
+  }
 }
 function insertTranscript(job) {
   if (!activeVoice(job) || !job.text || composing) return;
   const text = job.text;
   input.value += (input.value && !input.value.endsWith('\n') ? '\n' : '') + text;
   input.dispatchEvent(new Event('input'));
-  cancelVoice('已转写，请检查文字后发送。');
+  cancelVoice(voiceMode ? '已转写，点键盘查看文字。' : '已转写，请检查文字后发送。');
 }
 input.addEventListener('compositionstart', () => { composing = true; });
 input.addEventListener('compositionend', () => {
@@ -371,7 +393,6 @@ input.addEventListener('compositionend', () => {
 });
 async function uploadVoice(job) {
   if (!activeVoice(job)) return;
-  if (job.phase !== 'finishing') return cancelVoice('录音中断，请重新录制。', true);
   const blob = new Blob(job.chunks, { type: job.recorder.mimeType || job.type });
   job.chunks.length = 0;
   if (!blob.size) return cancelVoice('没有收到录音，请重新录制。', true);
@@ -386,11 +407,19 @@ async function uploadVoice(job) {
     if (activeVoice(job)) cancelVoice(error instanceof TypeError ? '录音上传失败，请检查连接后重录。' : error.message, true);
   }
 }
-mic.addEventListener('click', async () => {
-  if (voice) return finishRecording(voice);
+mic.addEventListener('click', () => {
+  if (mic.hidden || sending || !state.current) return;
+  voiceMode = !voiceMode;
+  if (voiceMode) input.blur();
+  else if (voice && voice.phase !== 'finishing') cancelVoice('已取消录音。');
+  if (!voice) voiceStatus('');
+  renderVoice();
+  if (!voiceMode) { input.dispatchEvent(new Event('input')); input.focus(); }
+});
+async function startPress(trigger) {
   const type = recordType();
-  if (!type || mic.hidden || sending || !state.current) return;
-  const job = voice = { type, visit: state.visit, key: sessionKey(state.current), phase: 'permission', bytes: 0, chunks: [] };
+  if (!type || !voiceMode || voice || sending || !state.current) return;
+  const job = voice = { trigger, type, visit: state.visit, key: sessionKey(state.current), phase: 'permission', bytes: 0, chunks: [] };
   voiceStatus('等待麦克风权限…'); renderVoice();
   try {
     job.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -405,21 +434,58 @@ mic.addEventListener('click', async () => {
       if (job.bytes > VOICE_BYTES) cancelVoice('录音超过 8 MB，请录短一点。', true);
       else job.chunks.push(data);
     };
-    job.recorder.onstop = () => uploadVoice(job);
+    job.recorder.onstop = () => {
+      if (!activeVoice(job)) return;
+      job.stopped = true;
+      if (job.phase === 'finishing') uploadVoice(job);
+      else if (job.phase !== 'limit') cancelVoice('录音中断，请重新录制。', true);
+    };
     job.recorder.onerror = () => { if (activeVoice(job)) cancelVoice('录音中断，请重新录制。', true); };
     job.recorder.start(1000);
     job.phase = 'recording';
     const start = performance.now();
-    voiceStatus('录音中 0 秒'); renderVoice();
+    const instruction = trigger.pointerId === undefined ? '' : ' · 上滑取消';
+    voiceStatus('录音中 0 秒' + instruction); renderVoice();
     job.timer = setInterval(() => {
       const elapsed = (performance.now() - start) / 1000;
-      // Leave room for the codec's final frame so the server accepts the auto-stopped clip.
-      if (elapsed >= VOICE_SECONDS - 0.5) finishRecording(job);
-      else voiceStatus(`录音中 ${Math.floor(elapsed)} 秒`);
+      // Leave room for the codec's final frame; at the limit still wait for the user to release.
+      if (elapsed >= VOICE_SECONDS - 0.5) finishRecording(job, true);
+      else voiceStatus(`录音中 ${Math.floor(elapsed)} 秒` + instruction);
     }, 250);
   } catch (error) {
     if (activeVoice(job)) cancelVoice(error.name === 'NotAllowedError' ? '麦克风权限未开启，请在浏览器设置中允许。' : '无法打开麦克风，请检查设备。', true);
   }
+}
+holdToTalk.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || !event.isPrimary || !voiceMode || voice || sending) return;
+  if (event.isTrusted) holdToTalk.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  startPress({ pointerId: event.pointerId, startY: event.clientY });
+});
+function updateDiscard(event) {
+  if (!voice || voice.trigger.pointerId !== event.pointerId || voice.phase === 'finishing') return false;
+  const discard = event.clientY < voice.trigger.startY - 64;
+  if (voice.discard !== discard) { voice.discard = discard; renderVoice(); }
+  return true;
+}
+holdToTalk.addEventListener('pointermove', updateDiscard);
+holdToTalk.addEventListener('pointerup', (event) => { if (updateDiscard(event)) releasePress(voice); });
+for (const eventName of ['pointercancel', 'lostpointercapture']) holdToTalk.addEventListener(eventName, (event) => {
+  if (voice?.trigger.pointerId === event.pointerId && voice.phase !== 'finishing') cancelVoice('已取消录音。');
+});
+holdToTalk.addEventListener('contextmenu', (event) => event.preventDefault());
+holdToTalk.addEventListener('keydown', (event) => {
+  if (![' ', 'Enter'].includes(event.key)) return;
+  event.preventDefault();
+  if (!event.repeat) startPress({ key: event.key });
+});
+holdToTalk.addEventListener('keyup', (event) => {
+  if (voice?.trigger.key !== event.key || voice.phase === 'finishing') return;
+  event.preventDefault();
+  releasePress(voice);
+});
+holdToTalk.addEventListener('blur', () => {
+  if (voice?.trigger.key && voice.phase !== 'finishing') cancelVoice('已取消录音。');
 });
 $('voice-cancel').addEventListener('click', () => cancelVoice('已取消录音。'));
 // With a hardware keyboard Enter sends and Ctrl+Enter (or Cmd/Shift+Enter) breaks the line. On a phone the
@@ -462,7 +528,7 @@ $('attached').addEventListener('click', (event) => {
 $('compose').addEventListener('submit', async (event) => {
   event.preventDefault();
   const pictures = attached, visit = state.visit, isCurrent = () => visit === state.visit;
-  let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending || voice) return;
+  let text = input.value; if ((!text.trim() && !pictures.length) || $('send').disabled || sending || voice || voiceMode) return;
   // One id per message: a retry after a dropped connection cannot type it into the agent twice.
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
   sending = true; renderVoice(); state.stick = true;
@@ -492,7 +558,7 @@ $('compose').addEventListener('submit', async (event) => {
 let swipe = null;
 $('chat').addEventListener('touchstart', (event) => {
   const touch = event.touches[0];
-  swipe = event.touches.length === 1 && !event.target.closest('.bar, #keys, textarea') ? { x: touch.clientX, y: touch.clientY, at: Date.now() } : null;
+  swipe = event.touches.length === 1 && !event.target.closest('.bar, #keys, #compose') ? { x: touch.clientX, y: touch.clientY, at: Date.now() } : null;
 }, { passive: true });
 $('chat').addEventListener('touchend', (event) => {
   if (!swipe || wideQuery.matches) return;
